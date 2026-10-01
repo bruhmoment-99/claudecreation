@@ -15,5 +15,9 @@
   "chestSearchRadius": 32,
   "skipBlocks": [],
   "scaffoldBlocks": ["dirt", "cobblestone", "cobbled_deepslate", "netherrack"],
-  "chat": true
+  "chat": true,
+
+  "retreatHealth": 6,
+  "huntMinutes": 5,
+  "guardAgainstPlayers": true
 }

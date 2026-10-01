@@ -68,6 +68,8 @@ async function cmdBuild (cfg) {
   const { pathfinder } = require('mineflayer-pathfinder')
   const { Vec3 } = require('vec3')
   const { Builder } = require('./builder')
+  const { Fighter } = require('./combat')
+  const { parseCommand, HELP } = require('./commands')
 
   const log = (...a) => console.log(`[${new Date().toLocaleTimeString()}]`, ...a)
 
@@ -81,16 +83,26 @@ async function cmdBuild (cfg) {
   bot.loadPlugin(pathfinder)
 
   let builder = null
+  let fighter = null
+  let resumeBuildAfterJob = false
+  let rotate = cfg.rotate || 0
 
-  const start = async (origin) => {
+  const start = async (origin, newRotate) => {
     if (builder.state === 'building' || builder.state === 'paused') {
       return builder.say(`Already ${builder.state}. Say "stop" first if you want to move the build.`)
     }
-    if (origin) builder.setOrigin(origin)
+    if (fighter.busy) fighter.stop(true)
+    resumeBuildAfterJob = false
+    if (newRotate !== undefined && newRotate !== rotate) {
+      rotate = newRotate
+      builder.plan = await loadPlan({ ...cfg, rotate }, bot.registry)
+    }
+    if (origin) builder.setOrigin(new Vec3(origin.x, origin.y, origin.z))
     if (!builder.origin) {
-      builder.say('Tell me where to build: stand on the spot for the corner and say "build here", or set "origin" in config.json.')
+      builder.say('Tell me where to build: say "build at <x> <y> <z>", or stand on the corner and say "build here".')
       return
     }
+    builder.bot.pathfinder.setMovements(builder.buildMoves)
     try {
       await builder.build()
     } catch (err) {
@@ -99,23 +111,59 @@ async function cmdBuild (cfg) {
     }
   }
 
+  // Hunting/guarding/following borrow the bot from the build, which picks up again afterwards
+  const runJob = async (job) => {
+    if (await builder.park()) {
+      resumeBuildAfterJob = true
+      builder.say('Pausing the build for this.')
+    }
+    try {
+      await job()
+    } catch (err) {
+      log('Job error:', err.stack || err.message)
+    }
+    if (!fighter.busy) maybeResumeBuild()
+  }
+
+  const maybeResumeBuild = () => {
+    if (!resumeBuildAfterJob) return
+    resumeBuildAfterJob = false
+    builder.bot.pathfinder.setMovements(builder.buildMoves)
+    builder.resume()
+    builder.say('Back to building.')
+  }
+
   const handle = (text, fromPos) => {
-    const cmd = text.trim().toLowerCase()
-    if (cmd === 'build here') {
-      if (!fromPos) return log('"build here" needs to be said in game (or set origin in config.json)')
-      start(fromPos.floored())
-    } else if (cmd === 'build' || cmd === 'start') start()
-    else if (cmd === 'pause') { builder.pause(); builder.say('Paused. Say "resume" to carry on.') } else if (cmd === 'resume') { builder.resume(); builder.say('Resuming.') } else if (cmd === 'stop') { builder.stop(); builder.say('Stopping after this block.') } else if (cmd === 'status') builder.say(builder.status())
-    else if (cmd === 'materials') {
-      const missing = builder.missingMaterials()
-      builder.say(Object.keys(missing).length ? 'Missing: ' + Object.entries(missing).map(([n, c]) => `${c} ${n}`).join(', ') : 'Nothing missing that I know of.')
-    } else if (cmd === 'come') {
-      const owner = cfg.owner && bot.players[cfg.owner]?.entity
-      if (owner) {
-        const { goals } = require('mineflayer-pathfinder')
-        bot.pathfinder.goto(new goals.GoalNear(owner.position.x, owner.position.y, owner.position.z, 2)).catch(() => {})
+    const c = parseCommand(text, fromPos)
+    if (!c) return false
+    switch (c.type) {
+      case 'error': builder.say(c.message); break
+      case 'help': builder.say(HELP); break
+      case 'build': start(c.origin, c.rotate); break
+      case 'pause': builder.pause(); builder.say('Paused. Say "resume" to carry on.'); break
+      case 'resume': builder.bot.pathfinder.setMovements(builder.buildMoves); builder.resume(); builder.say('Resuming.'); break
+      case 'stop':
+        // first "stop" ends a hunt/guard/follow, the next one stops the build
+        if (fighter.busy) { fighter.stop(); maybeResumeBuild() } else { builder.stop(); builder.say('Stopping after this block.') }
+        break
+      case 'status': builder.say(builder.status() + (fighter.busy ? ` (currently: ${fighter.job.kind}${fighter.job.target ? ' ' + fighter.job.target : ''})` : '')); break
+      case 'where':
+        builder.say(builder.origin
+          ? `Build goes from ${builder.min.x} ${builder.min.y} ${builder.min.z} to ${builder.max.x} ${builder.max.y} ${builder.max.z}${rotate ? ` (rotated ${rotate})` : ''}.`
+          : `No spot picked yet. The build is ${builder.plan.size.x} x ${builder.plan.size.y} x ${builder.plan.size.z} (x, y, z).`)
+        break
+      case 'materials': {
+        const missing = builder.missingMaterials()
+        builder.say(Object.keys(missing).length ? 'Missing: ' + Object.entries(missing).map(([n, k]) => `${k} ${n}`).join(', ') : 'Nothing missing that I know of.')
+        break
       }
-    } else if (cmd === 'quit') { bot.quit(); process.exit(0) } else return false
+      case 'hunt': runJob(() => fighter.hunt(c.player)); break
+      case 'guard': runJob(() => fighter.guard()); break
+      case 'follow': runJob(async () => fighter.follow()); break
+      case 'deliver': runJob(() => fighter.deliver()); break
+      case 'come': runJob(() => fighter.returnToOwner()); break
+      case 'quit': bot.quit(); process.exit(0)
+    }
     return true
   }
 
@@ -125,12 +173,13 @@ async function cmdBuild (cfg) {
     if (plan.unknown.length) log(`WARNING: not in ${bot.version}, skipping: ${plan.unknown.join(', ')}`)
     log(`Loaded ${path.basename(cfg.schematic)}: ${plan.steps.length} blocks`)
     builder = new Builder(bot, plan, cfg, log)
-    const origin = cfg.origin ? new Vec3(cfg.origin[0], cfg.origin[1], cfg.origin[2]) : null
+    fighter = new Fighter(bot, cfg, log, msg => builder.say(msg))
+    const origin = cfg.origin ? { x: cfg.origin[0], y: cfg.origin[1], z: cfg.origin[2] } : null
     if (origin) {
       await bot.waitForChunksToLoad()
       start(origin)
     } else {
-      builder.say('Hi! Stand where the build\'s corner should go and say "build here".')
+      builder.say('Hi! Say "build at <x> <y> <z>" (or stand on the spot and say "build here"). Say "help" for everything else.')
     }
   })
 
@@ -145,6 +194,7 @@ async function cmdBuild (cfg) {
 
   bot.on('death', () => {
     log('Died! Pausing - items are wherever I died.')
+    if (fighter) fighter.stop(true)
     if (builder) builder.pause()
   })
   bot.on('kicked', reason => log('Kicked:', typeof reason === 'string' ? reason : JSON.stringify(reason)))
@@ -155,9 +205,8 @@ async function cmdBuild (cfg) {
   const rl = readline.createInterface({ input: process.stdin })
   rl.on('line', line => {
     if (!builder) return
-    if (!handle(line, line.trim().toLowerCase() === 'build here' ? bot.entity.position : null)) {
-      bot.chat(line)
-    }
+    // in the terminal, "here" and "~" mean the bot's own position
+    if (!handle(line, bot.entity.position)) bot.chat(line)
   })
 }
 

@@ -81,9 +81,32 @@ class Builder {
   // ---------------------------------------------------------------- control
 
   async checkpoint () {
-    while (this.state === 'paused') await sleep(500)
+    while (this.state === 'paused') {
+      this.parked = true
+      await sleep(250)
+    }
+    this.parked = false
     if (this.state === 'stopping') throw new StopError()
     await this.eatIfHungry()
+  }
+
+  // Pause and wait until the build loop has actually let go of the bot (so something
+  // else, like a hunt, can use the pathfinder). Returns true if a build was interrupted.
+  async park () {
+    if (this.state !== 'building' && this.state !== 'paused') return false
+    this.pause()
+    for (let i = 0; i < 120 && !this.parked && this.state === 'paused'; i++) await sleep(250)
+    return true
+  }
+
+  // Walk to the site first if it's far away - chunks out of view aren't loaded
+  async travelToSite () {
+    const center = this.origin.offset(Math.floor(this.plan.size.x / 2), 0, Math.floor(this.plan.size.z / 2))
+    const pos = this.bot.entity.position
+    if (Math.hypot(pos.x - center.x, pos.z - center.z) < 48) return
+    this.say(`Heading to the build site at ${fmt(this.origin)} (${Math.round(pos.distanceTo(center))} blocks away)...`)
+    await this.goto(new goals.GoalNearXZ(center.x, center.z, 6))
+    await this.bot.waitForChunksToLoad()
   }
 
   pause () { if (this.state === 'building') { this.state = 'paused'; this.bot.pathfinder.stop() } }
@@ -104,6 +127,7 @@ class Builder {
     if (this.state === 'building' || this.state === 'paused') return
     this.state = 'building'
     try {
+      await this.travelToSite()
       await this.surveyChests()
       this.reportMaterials()
       if (this.config.clearArea !== false) await this.clearArea()
