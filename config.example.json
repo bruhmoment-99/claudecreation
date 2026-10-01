@@ -1,0 +1,19 @@
+{
+  "host": "localhost",
+  "port": 25565,
+  "username": "CannonBot",
+  "auth": "offline",
+  "version": false,
+
+  "owner": "YourMinecraftName",
+  "schematic": "schematics/orbital_cannon.litematic",
+  "origin": null,
+  "rotate": 0,
+
+  "clearArea": true,
+  "chests": [],
+  "chestSearchRadius": 32,
+  "skipBlocks": [],
+  "scaffoldBlocks": ["dirt", "cobblestone", "cobbled_deepslate", "netherrack"],
+  "chat": true
+}
