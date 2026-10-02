@@ -19,5 +19,12 @@
 
   "retreatHealth": 6,
   "huntMinutes": 5,
-  "guardAgainstPlayers": true
+  "guardAgainstPlayers": true,
+
+  "retryMinutes": 5,
+  "mindcraft": {
+    "path": "../mindcraft",
+    "username": "Gatherer",
+    "dropOff": null
+  }
 }

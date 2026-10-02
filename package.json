@@ -7,7 +7,8 @@
     "start": "node src/index.js build",
     "plan": "node src/index.js plan",
     "demo": "node scripts/make-demo.js",
-    "test": "node --test"
+    "test": "node --test",
+    "mindcraft": "node src/index.js mindcraft"
   },
   "repository": {
     "type": "git",

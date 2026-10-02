@@ -126,6 +126,8 @@ class Builder {
     if (!this.origin) throw new Error('No build origin set')
     if (this.state === 'building' || this.state === 'paused') return
     this.state = 'building'
+    // forget what the chests held last time - someone (or a gatherer bot) may have restocked them
+    this.chests.clear()
     try {
       await this.travelToSite()
       await this.surveyChests()

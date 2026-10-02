@@ -13,6 +13,7 @@ const USAGE = `
 Usage:
   node src/index.js plan  [config.json]   show the material list and build order (no Minecraft needed)
   node src/index.js build [config.json]   join the server and build it
+  node src/index.js mindcraft [config.json]  set up (and start) a Mindcraft bot that gathers the materials
 
 Copy config.example.json to config.json and fill it in first. See README.md.
 `
@@ -85,6 +86,7 @@ async function cmdBuild (cfg) {
   let builder = null
   let fighter = null
   let resumeBuildAfterJob = false
+  let retryTimer = null
   let rotate = cfg.rotate || 0
 
   const start = async (origin, newRotate) => {
@@ -108,6 +110,13 @@ async function cmdBuild (cfg) {
     } catch (err) {
       log('Build error:', err.stack || err.message)
       builder.say(`Something went wrong: ${err.message}. Say "build" to try again.`)
+    }
+    // Short on materials? Check the chests again later - a gatherer bot may be filling them
+    const retry = cfg.retryMinutes ?? 0
+    if (builder.state === 'waiting' && retry > 0) {
+      log(`Checking the chests again in ${retry} minute(s)...`)
+      clearTimeout(retryTimer)
+      retryTimer = setTimeout(() => { if (builder.state === 'waiting') start() }, retry * 60 * 1000)
     }
   }
 
@@ -216,6 +225,7 @@ async function main () {
   const cfg = loadConfig(file)
   if (cmd === 'plan') return cmdPlan(cfg)
   if (cmd === 'build') return cmdBuild(cfg)
+  if (cmd === 'mindcraft') return require('./mindcraft').run(cfg, await loadPlan(cfg, require('minecraft-data')(cfg.version || '1.21.4')))
   console.log(USAGE)
   process.exit(1)
 }

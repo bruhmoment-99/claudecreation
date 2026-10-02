@@ -27,9 +27,9 @@ It's built on [Mineflayer](https://github.com/PrismarineJS/mineflayer) and
 - Hunt down a player and bring you their loot, guard you, or follow you (see [Hunting](#hunting-guarding-and-following)).
 
 **It doesn't:**
-- **Gather raw materials.** It won't mine obsidian or farm creepers for gunpowder.
-  You have to put the materials in chests near the build site. Run
-  `npm run plan` first to get the exact shopping list.
+- **Gather raw materials by itself.** It builds from chests near the build site.
+  Fill them yourself (run `npm run plan` for the exact shopping list), or pair it with
+  a Mindcraft gatherer bot (see [Gathering materials with Mindcraft](#gathering-materials-with-mindcraft)).
 - **Come with a cannon design.** Orbital cannons depend on the Minecraft version
   and use very specific designs. Download a schematic made for **your exact
   version** (see below).
@@ -52,6 +52,58 @@ It's built on [Mineflayer](https://github.com/PrismarineJS/mineflayer) and
 6. Put those materials, plus some food, in chests near where the cannon will go.
    It finds chests within `chestSearchRadius` blocks, or you can list them in
    `chests`. It never takes from chests inside the build area.
+
+## Gathering materials with Mindcraft
+
+CannonBot only builds; it doesn't gather. [Mindcraft](https://github.com/kolbytn/mindcraft)
+is a separate, AI-driven Mineflayer bot that can chop, mine, smelt and craft. The two
+work as a pair: Mindcraft fills the supply chest, and CannonBot builds from it.
+
+1. Install Mindcraft next to this folder (it needs Node 18/20):
+   ```
+   git clone https://github.com/kolbytn/mindcraft ../mindcraft
+   cd ../mindcraft && npm install
+   ```
+2. In the Mindcraft folder, copy `keys.example.json` to `keys.json` and add your
+   `ANTHROPIC_API_KEY` (or set it as an environment variable). Mindcraft calls the
+   model constantly, so expect API costs to add up over a long gathering session.
+   `"mindcraft": { "model": "claude-sonnet-5-5" }` is a cheaper option.
+3. In your `config.json`, set `origin` (where the cannon goes), put a chest next to the
+   build site in `chests` (or `mindcraft.dropOff`), and set `"retryMinutes": 5`.
+4. Start both, in two terminals:
+   ```
+   npm run mindcraft     # the gatherer
+   npm start             # CannonBot
+   ```
+
+`npm run mindcraft` turns the cannon's material list into a goal for the gatherer
+("collect or craft 49 smooth_stone, 2 repeater, ... and put them in the chest at x y z;
+stay off the build site; don't break anything players built"). It writes Mindcraft's
+profile and settings to `mindcraft-setup/`, then launches Mindcraft with them, so you
+don't need to edit Mindcraft's own files. CannonBot builds what it can; when it runs short,
+it checks the chests again every `retryMinutes` and carries on as the deliveries arrive.
+
+Things to know:
+- Mindcraft is an AI agent, not a script. It's good at "get 20 cobblestone" or "craft a
+  furnace", and much less reliable at long crafting chains such as quartz for
+  comparators and observers (that means a trip to the Nether). Keep an eye on it, and
+  top up anything it struggles with yourself. Give it a smaller schematic first.
+- It doesn't handle TNT. Keep `"skipBlocks": ["tnt"]` and the gatherer won't be asked for it.
+- With `owner` set, it only talks to you (whispers), like CannonBot.
+- It supports Minecraft up to 1.21.11 (1.21.6 recommended by its authors).
+
+### Forge and other modded servers
+
+Neither bot works on a typical Forge/NeoForge modpack server. Both are built on Mineflayer,
+which speaks the **vanilla** protocol. Modded servers that require mods on the client
+reject vanilla clients at login, and modded blocks/items aren't in Mineflayer's data even
+when one does get in. What does work:
+- servers whose mods are **server-side only** and let vanilla clients join
+  (Paper/Spigot plugins, server-side Fabric mods such as Lithium);
+- vanilla servers, LAN worlds and Realms-style setups on a supported version.
+
+If your friends' server is a Forge modpack, you'd need a vanilla (or plugin-only)
+server for the bots.
 
 ## Where to get a cannon
 
@@ -193,6 +245,12 @@ to building when the hunt ends or when you say `stop`.
 | `retreatHealth` | `6` | Stop fighting at or below this much health (6 = 3 hearts) |
 | `huntMinutes` | `5` | Give up a hunt after this long |
 | `guardAgainstPlayers` | `true` | In `guard` mode, also fight players who hit you |
+| `retryMinutes` | `0` | When the build is short on materials, check the chests again every this many minutes (use with Mindcraft) |
+| `mindcraft.path` | – | Your Mindcraft folder. `npm run mindcraft` starts it from there |
+| `mindcraft.username` | `Gatherer` | The Mindcraft bot's name (must differ from `username`) |
+| `mindcraft.dropOff` | first of `chests` | `[x, y, z]` of the chest the gatherer delivers to |
+| `mindcraft.model` | Claude Opus 5.5 | Any Mindcraft `model` value, e.g. `"claude-sonnet-5-5"` to spend less |
+| `mindcraft.settings` | – | Extra Mindcraft `settings.js` values to override |
 
 ## Safety
 
@@ -213,6 +271,7 @@ src/planner.js     build order and material list
 src/builder.js     the bot: chests, clearing, pathfinding, placing, checking
 src/combat.js      hunt / guard / follow
 src/commands.js    chat command parsing
+src/mindcraft.js   Mindcraft gatherer setup
 src/index.js       CLI, config, chat commands
 ```
 
