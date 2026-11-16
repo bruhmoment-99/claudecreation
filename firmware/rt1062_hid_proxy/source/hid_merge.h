@@ -29,6 +29,8 @@ typedef struct __attribute__((packed))
 #define HID_BTN_LEFT   0x01U
 #define HID_BTN_RIGHT  0x02U
 #define HID_BTN_MIDDLE 0x04U
+#define HID_BTN_SIDE1  0x08U /* button 4 - "Back"    */
+#define HID_BTN_SIDE2  0x10U /* button 5 - "Forward" */
 
 /* Implemented by usb_device.c (stubbed in unit tests). Returns true if the
  * transfer was queued; on true, hid_merge_on_tx_complete() must follow. */
@@ -51,6 +53,8 @@ void hid_merge_physical_disconnected(void);
 void hid_merge_inject_move(int32_t dx, int32_t dy);
 void hid_merge_inject_wheel(int32_t delta);
 void hid_merge_inject_button(uint8_t mask, bool pressed);
+/* Replace the whole injected button byte (cmd.buttons(mask), cmd.release()). */
+void hid_merge_set_injected_buttons(uint8_t mask);
 
 /* Logical state = physical OR injected. */
 uint8_t hid_merge_get_logical_buttons(void);

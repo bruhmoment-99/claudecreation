@@ -47,15 +47,30 @@ static char s_out[512];
 static size_t s_outLen;
 static void cap_write(const char *d, size_t n)
 {
+    if (s_outLen + n >= sizeof(s_out))
+    {
+        abort();
+    }
     memcpy(&s_out[s_outLen], d, n);
     s_outLen += n;
     s_out[s_outLen] = 0;
 }
+static int s_sleepCalls;
+static uint32_t s_sleptMs;
+static char s_outAtSleep[512]; /* output already written when sleep began */
+static void cap_sleep(uint32_t ms)
+{
+    s_sleepCalls++;
+    s_sleptMs = ms;
+    memcpy(s_outAtSleep, s_out, s_outLen + 1);
+}
+static const cmd_io_t s_io = {cap_write, cap_sleep};
+
 static const char *run_cmd(const char *line)
 {
     s_outLen = 0;
     s_out[0] = 0;
-    cmd_execute_line(line, strlen(line), cap_write);
+    cmd_execute_line(line, strlen(line), &s_io);
     return s_out;
 }
 
@@ -200,13 +215,12 @@ static void test_parser_reject(void)
 /* ========================================================================= */
 static void test_commands(void)
 {
-    printf("command parser\n");
+    printf("command parser: original commands\n");
     reset_usb();
 
     CHECK(strcmp(run_cmd("cmd.move(10,-5)"), "cmd.move(10,-5)\r\n>>> ") == 0);
     CHECK(s_nSent == 1 && s_sent[0].x == 10 && s_sent[0].y == -5);
     hid_merge_on_tx_complete();
-
     CHECK(strcmp(run_cmd("cmd.move( 3 , 4 )"), "cmd.move( 3 , 4 )\r\n>>> ") == 0);
     hid_merge_on_tx_complete();
 
@@ -217,41 +231,152 @@ static void test_commands(void)
     CHECK(strcmp(run_cmd("cmd.left(0)"), "cmd.left(0)\r\n>>> ") == 0);
     hid_merge_on_tx_complete();
 
-    /* query reflects the logical (physical | injected) state */
     hid_merge_physical(HID_BTN_MIDDLE, true, 0, 0, 0);
     hid_merge_on_tx_complete();
     CHECK(strcmp(run_cmd("cmd.middle()"), "cmd.middle()\r\n1\r\n>>> ") == 0);
+    hid_merge_physical(0, true, 0, 0, 0);
+    hid_merge_on_tx_complete();
 
     CHECK(strcmp(run_cmd("cmd.wheel(-2)"), "cmd.wheel(-2)\r\n>>> ") == 0);
     hid_merge_on_tx_complete();
-    CHECK(strcmp(run_cmd("cmd.right(1)"), "cmd.right(1)\r\n>>> ") == 0);
+}
+
+static void test_side_buttons(void)
+{
+    printf("command parser: side buttons + locking\n");
+    reset_usb();
+
+    CHECK(strcmp(run_cmd("cmd.side1(1)"), "cmd.side1(1)\r\n>>> ") == 0);
+    CHECK(s_nSent == 1 && s_sent[0].buttons == HID_BTN_SIDE1); /* bit 3 = button 4 */
+    hid_merge_on_tx_complete();
+    CHECK(strcmp(run_cmd("cmd.side2(1)"), "cmd.side2(1)\r\n>>> ") == 0);
+    CHECK(s_nSent == 2 && s_sent[1].buttons == (HID_BTN_SIDE1 | HID_BTN_SIDE2));
+    hid_merge_on_tx_complete();
+    CHECK(strcmp(run_cmd("cmd.side2()"), "cmd.side2()\r\n1\r\n>>> ") == 0);
+
+    /* physical side1 already held + injected side1 -> no duplicate report */
+    run_cmd("cmd.release()");
+    hid_merge_on_tx_complete();
+    hid_merge_physical(HID_BTN_SIDE1, true, 0, 0, 0);
+    hid_merge_on_tx_complete();
+    int n = s_nSent;
+    CHECK(strcmp(run_cmd("cmd.side1(1)"), "cmd.side1(1)\r\n>>> ") == 0);
+    CHECK(s_nSent == n);
+    CHECK(strcmp(run_cmd("cmd.side1(0)"), "cmd.side1(0)\r\n>>> ") == 0);
+    CHECK(s_nSent == n); /* physical still holds it */
+    hid_merge_physical(0, true, 0, 0, 0);
+    CHECK(s_nSent == n + 1 && s_sent[n].buttons == 0);
+    hid_merge_on_tx_complete();
+}
+
+static void test_state_commands(void)
+{
+    printf("command parser: buttons(mask) / release()\n");
+    reset_usb();
+
+    CHECK(strcmp(run_cmd("cmd.buttons(19)"), "cmd.buttons(19)\r\n>>> ") == 0); /* L+R+side2 */
+    CHECK(s_nSent == 1 && s_sent[0].buttons == 19);
+    hid_merge_on_tx_complete();
+    CHECK(strcmp(run_cmd("cmd.buttons()"), "cmd.buttons()\r\n19\r\n>>> ") == 0);
+
+    /* same mask again -> logical unchanged -> no report */
+    run_cmd("cmd.buttons(19)");
+    CHECK(s_nSent == 1);
+
+    /* physical left held; release() clears injected only */
+    hid_merge_physical(HID_BTN_LEFT, true, 0, 0, 0);
+    CHECK(s_nSent == 1); /* left already logically down */
+    CHECK(strcmp(run_cmd("cmd.release()"), "cmd.release()\r\n>>> ") == 0);
+    CHECK(s_nSent == 2 && s_sent[1].buttons == HID_BTN_LEFT);
     hid_merge_on_tx_complete();
 
-    /* errors */
-    CHECK(strcmp(run_cmd("cmd.left(2)"), "cmd.left(2)\r\nERR\r\n>>> ") == 0);
-    CHECK(strcmp(run_cmd("cmd.move(1)"), "cmd.move(1)\r\nERR\r\n>>> ") == 0);
-    CHECK(strcmp(run_cmd("cmd.move(1,2,3)"), "cmd.move(1,2,3)\r\nERR\r\n>>> ") == 0);
-    CHECK(strcmp(run_cmd("cmd.move(a,2)"), "cmd.move(a,2)\r\nERR\r\n>>> ") == 0);
-    CHECK(strcmp(run_cmd("cmd.jump(1)"), "cmd.jump(1)\r\nERR\r\n>>> ") == 0);
-    CHECK(strcmp(run_cmd("hello"), "hello\r\nERR\r\n>>> ") == 0);
+    /* release with nothing injected -> no report */
+    run_cmd("cmd.release()");
+    CHECK(s_nSent == 2);
 
-    /* streaming feed: CRLF framing, split across chunks, two commands */
+    CHECK(strcmp(run_cmd("cmd.buttons(255)"), "cmd.buttons(255)\r\n>>> ") == 0);
+    CHECK(s_sent[2].buttons == 255);
+    hid_merge_on_tx_complete();
+    CHECK(strcmp(run_cmd("cmd.buttons(0)"), "cmd.buttons(0)\r\n>>> ") == 0);
+    CHECK(s_sent[3].buttons == HID_BTN_LEFT);
+    hid_merge_on_tx_complete();
+}
+
+static void test_utility_commands(void)
+{
+    printf("command parser: sleep / version / info\n");
+    reset_usb();
+
+    CHECK(strcmp(run_cmd("cmd.version()"), "cmd.version()\r\n1.0.0\r\n>>> ") == 0);
+    CHECK(strcmp(run_cmd("cmd.info()"), "cmd.info()\r\nHID-Proxy-RT1062\r\n>>> ") == 0);
+
+    /* sleep: prompt must be fully written BEFORE the sleep starts */
+    s_sleepCalls = 0;
+    CHECK(strcmp(run_cmd("cmd.sleep(250)"), "cmd.sleep(250)\r\n>>> ") == 0);
+    CHECK(s_sleepCalls == 1 && s_sleptMs == 250);
+    CHECK(strcmp(s_outAtSleep, "cmd.sleep(250)\r\n>>> ") == 0);
+
+    s_sleepCalls = 0;
+    run_cmd("cmd.sleep(0)");
+    CHECK(s_sleepCalls == 0);
+
+    /* streaming: commands after a sleep run after it, in order */
     cmd_parser_t p;
-    cmd_parser_init(&p, cap_write);
+    cmd_parser_init(&p, &s_io);
+    s_outLen     = 0;
+    s_sleepCalls = 0;
+    const char *in = "cmd.left(1)\r\ncmd.sleep(5)\r\ncmd.left(0)\r\n";
+    cmd_parser_feed(&p, (const uint8_t *)in, strlen(in));
+    CHECK(s_sleepCalls == 1);
+    CHECK(strcmp(s_outAtSleep, "cmd.left(1)\r\n>>> cmd.sleep(5)\r\n>>> ") == 0);
+    CHECK(strcmp(s_out, "cmd.left(1)\r\n>>> cmd.sleep(5)\r\n>>> cmd.left(0)\r\n>>> ") == 0);
+}
+
+static void test_silent_ignore(void)
+{
+    printf("command parser: invalid input is silently ignored\n");
+    reset_usb();
+
+    static const char *bad[] = {
+        "cmd.left(2)",    "cmd.left(1,1)",  "cmd.side1(-1)",   "cmd.move(1)",       "cmd.move(1,2,3)",
+        "cmd.move(a,2)",  "cmd.jump(1)",    "hello",           "cmd.buttons(256)",  "cmd.buttons(-1)",
+        "cmd.release(1)", "cmd.sleep()",    "cmd.sleep(-5)",   "cmd.sleep(999999999)", "cmd.version(1)",
+        "cmd.info(x)",    "cmd.left",       "cmd.left(1",      "cmd.left((1))",     "CMD.left(1)",
+        "cmd.left(1)x",   "cmd.wheel()",    "cmd.move(,)",     "cmd.move(1,)",      "",
+    };
+    s_sleepCalls = 0;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        s_outLen = 0;
+        s_out[0] = 0;
+        int ok   = cmd_execute_line(bad[i], strlen(bad[i]), &s_io);
+        if (ok != 0 || s_outLen != 0)
+        {
+            printf("  not ignored: \"%s\"\n", bad[i]);
+        }
+        CHECK(ok == 0);
+        CHECK(s_outLen == 0);
+    }
+    CHECK(s_nSent == 0);      /* and no side effects */
+    CHECK(s_sleepCalls == 0);
+    CHECK(hid_merge_get_logical_buttons() == 0);
+
+    /* streaming: overlong line and garbage produce no output at all */
+    cmd_parser_t p;
+    cmd_parser_init(&p, &s_io);
     s_outLen = 0;
+    char longl[200];
+    memset(longl, 'x', sizeof(longl));
+    cmd_parser_feed(&p, (const uint8_t *)longl, sizeof(longl));
+    cmd_parser_feed(&p, (const uint8_t *)"\r\n\r\ngarbage\r\n", 13);
+    CHECK(s_outLen == 0);
+
+    /* framing still works afterwards, split across chunks */
     const char *a = "cmd.mo";
     const char *b = "ve(1,1)\r\ncmd.left()\r\n";
     cmd_parser_feed(&p, (const uint8_t *)a, strlen(a));
     cmd_parser_feed(&p, (const uint8_t *)b, strlen(b));
     CHECK(strcmp(s_out, "cmd.move(1,1)\r\n>>> cmd.left()\r\n0\r\n>>> ") == 0);
-
-    /* overlong line */
-    s_outLen = 0;
-    char longl[200];
-    memset(longl, 'x', sizeof(longl));
-    cmd_parser_feed(&p, (const uint8_t *)longl, sizeof(longl));
-    cmd_parser_feed(&p, (const uint8_t *)"\r\n", 2);
-    CHECK(strcmp(s_out, "ERR\r\n>>> ") == 0);
 }
 
 int main(void)
@@ -262,6 +387,10 @@ int main(void)
     test_parser_gaming();
     test_parser_reject();
     test_commands();
+    test_side_buttons();
+    test_state_commands();
+    test_utility_commands();
+    test_silent_ignore();
     if (s_fail)
     {
         printf("%d check(s) FAILED\n", s_fail);

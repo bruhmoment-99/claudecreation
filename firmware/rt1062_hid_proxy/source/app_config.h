@@ -16,6 +16,9 @@
 #define APP_UART_RX_RING_SIZE       4096U     /* power of two; ~6.8 ms @6Mbd  */
 #define APP_UART_DMA_CHANNEL        0U        /* eDMA channel used for RX     */
 #define APP_CMD_MAX_LINE            96U       /* longest accepted command     */
+#define APP_CMD_SLEEP_MAX_MS        600000U   /* cmd.sleep() upper bound      */
+#define APP_FW_VERSION              "1.0.0"
+#define APP_DEVICE_INFO             "HID-Proxy-RT1062"
 
 /* ------------------------------------------------------------------------- */
 /* Injection behaviour                                                       */

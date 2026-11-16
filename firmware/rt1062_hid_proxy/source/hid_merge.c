@@ -240,6 +240,15 @@ void hid_merge_inject_button(uint8_t mask, bool pressed)
     try_send();
 }
 
+void hid_merge_set_injected_buttons(uint8_t mask)
+{
+    uint32_t m     = CRIT_ENTER();
+    s_m.injButtons = mask;
+    CRIT_EXIT(m);
+    /* Same locking rule: only reported if (physical | injected) changes. */
+    try_send();
+}
+
 uint8_t hid_merge_get_logical_buttons(void)
 {
     uint32_t m = CRIT_ENTER();

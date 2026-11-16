@@ -133,12 +133,40 @@ FreeRTOS (heap_4, ≥ 24 KB). Preprocessor: `CPU_MIMXRT1062DVJ6B`,
 
 ## Command protocol
 
+One command per line, terminated by `\r\n`. A command with a valid name and
+valid arguments is echoed back, followed by `\r\n>>> `. Queries and
+`version`/`info` put their value on its own line before the prompt.
+**Anything invalid gets no reply at all and changes nothing**: an unknown
+name, bad or out-of-range arguments, or a line longer than 96 characters.
+
+| Command | Effect | Reply |
+|---------|--------|-------|
+| `cmd.left(v)` `cmd.right(v)` `cmd.middle(v)` | Injected button 1/2/3, `v` = 1 press / 0 release | echo |
+| `cmd.side1(v)` | Button 4 (Back), report bit 3 | echo |
+| `cmd.side2(v)` | Button 5 (Forward), report bit 4 | echo |
+| `cmd.left()` … `cmd.side2()` | Query | `0` or `1` (physical OR injected) |
+| `cmd.buttons(mask)` | Replace the whole injected button byte (0–255) | echo |
+| `cmd.buttons()` | Query | logical button byte |
+| `cmd.release()` | Clear every injected button | echo |
+| `cmd.move(dx,dy)` / `cmd.wheel(d)` | Add motion | echo |
+| `cmd.sleep(ms)` | Prompt goes out first, then the parser task sleeps (0–600000 ms) | echo |
+| `cmd.version()` / `cmd.info()` | | `1.0.0` / `HID-Proxy-RT1062` |
+
+All button commands follow the button-locking rule. `release()` and
+`buttons(mask)` only replace the *injected* state. A button held on the
+physical mouse stays pressed, and a report goes out only if the logical byte
+changes.
+
+`cmd.sleep` blocks only the parser task. Physical forwarding (host stack task
+and USB ISRs) keeps running, and the DMA ring keeps receiving. Commands sent
+during the sleep run in order once it ends. The ring holds 4096 bytes (roughly
+200 commands), and anything past that during a single sleep is lost.
+
 ```
-cmd.move(10,-5)\r\n    ->  cmd.move(10,-5)\r\n>>>
-cmd.left(1)\r\n        ->  cmd.left(1)\r\n>>>
-cmd.left()\r\n         ->  cmd.left()\r\n1\r\n>>>         (logical state = physical | injected)
-cmd.wheel(-1)\r\n      ->  cmd.wheel(-1)\r\n>>>
-cmd.left(2)\r\n        ->  cmd.left(2)\r\nERR\r\n>>>
+cmd.side1(1)\r\n   ->  cmd.side1(1)\r\n>>> 
+cmd.buttons()\r\n  ->  cmd.buttons()\r\n8\r\n>>> 
+cmd.version()\r\n  ->  cmd.version()\r\n1.0.0\r\n>>> 
+cmd.left(2)\r\n    ->  (nothing)
 ```
 
 ## Verification status

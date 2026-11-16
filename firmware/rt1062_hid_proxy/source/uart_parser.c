@@ -24,26 +24,55 @@
 
 #define MAX_ARGS 2
 
-static void put_str(cmd_write_fn_t w, const char *s)
+typedef enum
 {
-    w(s, strlen(s));
+    CMD_MOVE,
+    CMD_WHEEL,
+    CMD_BUTTON,  /* left/right/middle/side1/side2: arg = bit mask in table */
+    CMD_BUTTONS,
+    CMD_RELEASE,
+    CMD_SLEEP,
+    CMD_VERSION,
+    CMD_INFO,
+} cmd_kind_t;
+
+typedef struct
+{
+    const char *name;
+    cmd_kind_t kind;
+    uint8_t mask; /* CMD_BUTTON only */
+} cmd_def_t;
+
+static const cmd_def_t s_commands[] = {
+    {"move", CMD_MOVE, 0U},
+    {"wheel", CMD_WHEEL, 0U},
+    {"left", CMD_BUTTON, HID_BTN_LEFT},
+    {"right", CMD_BUTTON, HID_BTN_RIGHT},
+    {"middle", CMD_BUTTON, HID_BTN_MIDDLE},
+    {"side1", CMD_BUTTON, HID_BTN_SIDE1},
+    {"side2", CMD_BUTTON, HID_BTN_SIDE2},
+    {"buttons", CMD_BUTTONS, 0U},
+    {"release", CMD_RELEASE, 0U},
+    {"sleep", CMD_SLEEP, 0U},
+    {"version", CMD_VERSION, 0U},
+    {"info", CMD_INFO, 0U},
+};
+
+static void put_str(const cmd_io_t *io, const char *s)
+{
+    io->write(s, strlen(s));
 }
 
-static void put_int(cmd_write_fn_t w, int32_t v)
+static void put_uint(const cmd_io_t *io, uint32_t u)
 {
-    char buf[12];
-    int i      = (int)sizeof(buf);
-    uint32_t u = (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+    char buf[10];
+    int i = (int)sizeof(buf);
     do
     {
         buf[--i] = (char)('0' + (u % 10U));
         u /= 10U;
     } while (u != 0U);
-    if (v < 0)
-    {
-        buf[--i] = '-';
-    }
-    w(&buf[i], sizeof(buf) - (size_t)i);
+    io->write(&buf[i], sizeof(buf) - (size_t)i);
 }
 
 static bool is_space(char c)
@@ -93,48 +122,95 @@ static bool parse_int(const char *s, const char *e, int32_t *out)
     return true;
 }
 
-typedef enum
+static const cmd_def_t *lookup(const char *name, size_t n)
 {
-    CMD_MOVE,
-    CMD_LEFT,
-    CMD_RIGHT,
-    CMD_MIDDLE,
-    CMD_WHEEL,
-    CMD_UNKNOWN
-} cmd_id_t;
-
-static cmd_id_t lookup(const char *name, size_t n)
-{
-    static const struct
+    for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]); i++)
     {
-        const char *name;
-        cmd_id_t id;
-    } table[] = {
-        {"move", CMD_MOVE}, {"left", CMD_LEFT}, {"right", CMD_RIGHT}, {"middle", CMD_MIDDLE}, {"wheel", CMD_WHEEL},
-    };
-    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
-    {
-        if ((strlen(table[i].name) == n) && (memcmp(table[i].name, name, n) == 0))
+        if ((strlen(s_commands[i].name) == n) && (memcmp(s_commands[i].name, name, n) == 0))
         {
-            return table[i].id;
+            return &s_commands[i];
         }
     }
-    return CMD_UNKNOWN;
+    return NULL;
 }
 
 /*
- * Execute one command line (without the line terminator).
- * Returns via write(): echo + optional result + prompt.
+ * Split "cmd.<name>(<args>)" into a command definition and integer args.
+ * Returns false for anything that is not syntactically a known command.
  */
-void cmd_execute_line(const char *line, size_t len, cmd_write_fn_t write)
+static bool parse_command(const char *s, const char *e, const cmd_def_t **def, int32_t *argv, int *argc)
+{
+    if (((size_t)(e - s) < 6U) || (memcmp(s, "cmd.", 4) != 0) || (e[-1] != ')'))
+    {
+        return false;
+    }
+    const char *name = s + 4;
+    const char *lp   = memchr(name, '(', (size_t)(e - name));
+    const char *rp   = e - 1;
+    if (lp == NULL)
+    {
+        return false;
+    }
+    *def = lookup(name, (size_t)(lp - name));
+    if (*def == NULL)
+    {
+        return false;
+    }
+
+    /* Empty (or blank) parentheses -> zero arguments. */
+    *argc         = 0;
+    const char *a = lp + 1;
+    bool blank    = true;
+    for (const char *c = a; c < rp; c++)
+    {
+        if (!is_space(*c))
+        {
+            blank = false;
+            break;
+        }
+    }
+    if (blank)
+    {
+        return true;
+    }
+
+    for (const char *c = a;; c++)
+    {
+        if ((c == rp) || (*c == ','))
+        {
+            if ((*argc == MAX_ARGS) || !parse_int(a, c, &argv[*argc]))
+            {
+                return false; /* too many args, or not an integer */
+            }
+            (*argc)++;
+            a = c + 1;
+            if (c == rp)
+            {
+                return true;
+            }
+        }
+        else if (*c == '(' || *c == ')')
+        {
+            return false; /* nested / stray parentheses */
+        }
+    }
+}
+
+int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
 {
     const char *s = line;
     const char *e = line + len;
-    bool ok       = false;
-    bool isQuery  = false;
-    int32_t queryValue = 0;
+    const cmd_def_t *def;
+    int32_t v[MAX_ARGS] = {0, 0};
+    int argc            = 0;
 
-    /* trim */
+    /* What a valid command produces besides the echo: */
+    const char *strResult = NULL;  /* version / info               */
+    bool numResult        = false; /* button queries               */
+    uint32_t numValue     = 0U;
+    uint32_t sleepMs      = 0U;
+    bool doSleep          = false;
+
     while ((s < e) && is_space(*s))
     {
         s++;
@@ -143,142 +219,126 @@ void cmd_execute_line(const char *line, size_t len, cmd_write_fn_t write)
     {
         e--;
     }
-    if (s == e)
+    if (!parse_command(s, e, &def, v, &argc))
     {
-        put_str(write, ">>> "); /* empty line: just re-prompt */
-        return;
+        return 0; /* not a command: silently ignored */
     }
 
-    do
+    /*
+     * Validate arguments FIRST and only then act, so an invalid command has
+     * no side effects at all (it is silently ignored like an unknown one).
+     */
+    switch (def->kind)
     {
-        if (((size_t)(e - s) < 4U) || (memcmp(s, "cmd.", 4) != 0))
-        {
-            break;
-        }
-        const char *name = s + 4;
-        const char *lp   = memchr(name, '(', (size_t)(e - name));
-        if ((lp == NULL) || (e[-1] != ')'))
-        {
-            break;
-        }
-        const char *rp = e - 1;
-        cmd_id_t id    = lookup(name, (size_t)(lp - name));
-
-        /* split args on ',' */
-        const char *argS[MAX_ARGS];
-        const char *argE[MAX_ARGS];
-        int argc        = 0;
-        const char *a   = lp + 1;
-        bool tooMany    = false;
-        bool blank      = true;
-        for (const char *c = a; c < rp; c++)
-        {
-            if (!is_space(*c))
+        case CMD_MOVE:
+            if (argc != 2)
             {
-                blank = false;
-                break;
+                return 0;
             }
-        }
-        if (!blank)
-        {
-            for (const char *c = a;; c++)
-            {
-                if ((c == rp) || (*c == ','))
-                {
-                    if (argc == MAX_ARGS)
-                    {
-                        tooMany = true;
-                        break;
-                    }
-                    argS[argc] = a;
-                    argE[argc] = c;
-                    argc++;
-                    a = c + 1;
-                    if (c == rp)
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-        if (tooMany)
-        {
+            hid_merge_inject_move(v[0], v[1]);
             break;
-        }
 
-        int32_t v[MAX_ARGS] = {0, 0};
-        bool argsOk         = true;
-        for (int k = 0; k < argc; k++)
-        {
-            argsOk = argsOk && parse_int(argS[k], argE[k], &v[k]);
-        }
-        if (!argsOk)
-        {
-            break;
-        }
-
-        switch (id)
-        {
-            case CMD_MOVE:
-                if (argc == 2)
-                {
-                    hid_merge_inject_move(v[0], v[1]);
-                    ok = true;
-                }
-                break;
-
-            case CMD_WHEEL:
-                if (argc == 1)
-                {
-                    hid_merge_inject_wheel(v[0]);
-                    ok = true;
-                }
-                break;
-
-            case CMD_LEFT:
-            case CMD_RIGHT:
-            case CMD_MIDDLE:
+        case CMD_WHEEL:
+            if (argc != 1)
             {
-                uint8_t mask = (id == CMD_LEFT) ? HID_BTN_LEFT : ((id == CMD_RIGHT) ? HID_BTN_RIGHT : HID_BTN_MIDDLE);
-                if (argc == 0)
-                {
-                    isQuery    = true;
-                    queryValue = ((hid_merge_get_logical_buttons() & mask) != 0U) ? 1 : 0;
-                    ok         = true;
-                }
-                else if ((argc == 1) && ((v[0] == 0) || (v[0] == 1)))
-                {
-                    /* Button locking is enforced inside hid_merge: a report is
-                     * only sent if (physical | injected) actually changes. */
-                    hid_merge_inject_button(mask, v[0] == 1);
-                    ok = true;
-                }
-                break;
+                return 0;
             }
+            hid_merge_inject_wheel(v[0]);
+            break;
 
-            default:
-                break;
-        }
-    } while (0);
+        case CMD_BUTTON:
+            if (argc == 0)
+            {
+                numResult = true;
+                numValue  = ((hid_merge_get_logical_buttons() & def->mask) != 0U) ? 1U : 0U;
+            }
+            else if ((argc == 1) && ((v[0] == 0) || (v[0] == 1)))
+            {
+                /* Button locking happens in hid_merge: no report unless
+                 * (physical | injected) changes. */
+                hid_merge_inject_button(def->mask, v[0] == 1);
+            }
+            else
+            {
+                return 0;
+            }
+            break;
 
-    /* Echo exactly what was received (trimmed), then result and prompt. */
-    write(s, (size_t)(e - s));
-    if (!ok)
-    {
-        put_str(write, "\r\nERR");
+        case CMD_BUTTONS:
+            if (argc == 0)
+            {
+                numResult = true;
+                numValue  = hid_merge_get_logical_buttons();
+            }
+            else if ((argc == 1) && (v[0] >= 0) && (v[0] <= 255))
+            {
+                hid_merge_set_injected_buttons((uint8_t)v[0]);
+            }
+            else
+            {
+                return 0;
+            }
+            break;
+
+        case CMD_RELEASE:
+            if (argc != 0)
+            {
+                return 0;
+            }
+            /* Clears every injected button (left, right, middle, side1, side2
+             * and buttons 6-8). Buttons held on the physical mouse stay
+             * pressed, so a report is sent only if the logical state changes. */
+            hid_merge_set_injected_buttons(0U);
+            break;
+
+        case CMD_SLEEP:
+            if ((argc != 1) || (v[0] < 0) || ((uint32_t)v[0] > APP_CMD_SLEEP_MAX_MS))
+            {
+                return 0;
+            }
+            doSleep = true;
+            sleepMs = (uint32_t)v[0];
+            break;
+
+        case CMD_VERSION:
+        case CMD_INFO:
+            if (argc != 0)
+            {
+                return 0;
+            }
+            strResult = (def->kind == CMD_VERSION) ? APP_FW_VERSION : APP_DEVICE_INFO;
+            break;
+
+        default:
+            return 0;
     }
-    else if (isQuery)
+
+    /* Echo exactly what was received (trimmed), optional result, prompt. */
+    io->write(s, (size_t)(e - s));
+    if (strResult != NULL)
     {
-        put_str(write, "\r\n");
-        put_int(write, queryValue);
+        put_str(io, "\r\n");
+        put_str(io, strResult);
     }
-    put_str(write, "\r\n>>> ");
+    else if (numResult)
+    {
+        put_str(io, "\r\n");
+        put_uint(io, numValue);
+    }
+    put_str(io, "\r\n>>> ");
+
+    /* cmd.sleep: the prompt is already out; now block only this task. */
+    if (doSleep && (io->sleep_ms != NULL) && (sleepMs > 0U))
+    {
+        io->sleep_ms(sleepMs);
+    }
+    return 1;
 }
 
-void cmd_parser_init(cmd_parser_t *p, cmd_write_fn_t write)
+void cmd_parser_init(cmd_parser_t *p, const cmd_io_t *io)
 {
     memset(p, 0, sizeof(*p));
-    p->write = write;
+    p->io = io;
 }
 
 void cmd_parser_feed(cmd_parser_t *p, const uint8_t *data, size_t len)
@@ -288,15 +348,11 @@ void cmd_parser_feed(cmd_parser_t *p, const uint8_t *data, size_t len)
         char c = (char)data[i];
         if ((c == '\r') || (c == '\n'))
         {
-            /* "\r\n": the '\r' completes the line, the '\n' then sees an empty
-             * buffer and is ignored (so no extra prompt is printed). */
-            if (p->overflow)
+            /* "\r\n": '\r' completes the line, the '\n' then sees an empty
+             * buffer and is ignored. Overlong lines are dropped silently. */
+            if (!p->overflow && (p->len > 0U))
             {
-                put_str(p->write, "ERR\r\n>>> ");
-            }
-            else if (p->len > 0U)
-            {
-                cmd_execute_line(p->line, p->len, p->write);
+                (void)cmd_execute_line(p->line, p->len, p->io);
             }
             p->len      = 0U;
             p->overflow = 0U;
@@ -344,6 +400,24 @@ AT_NONCACHEABLE_SECTION_ALIGN(static uint8_t s_rxRing[APP_UART_RX_RING_SIZE], 32
 static TaskHandle_t s_uartTask;
 static uint32_t s_rd;
 static cmd_parser_t s_parser;
+
+static void uart_write(const char *data, size_t len);
+static void uart_sleep(uint32_t ms);
+
+static const cmd_io_t s_io = {uart_write, uart_sleep};
+
+static void uart_sleep(uint32_t ms)
+{
+    /*
+     * cmd.sleep(): blocks only this (medium priority) task. The USB host stack
+     * task and both USB ISRs keep forwarding the physical mouse, and the eDMA
+     * keeps filling the RX ring. Commands that arrive meanwhile run, in order,
+     * once the sleep ends. The ring holds APP_UART_RX_RING_SIZE bytes (roughly
+     * 200 typical commands); anything beyond that during one sleep is lost.
+     * APP_CMD_SLEEP_MAX_MS keeps ms * configTICK_RATE_HZ within 32 bits.
+     */
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
 
 static void uart_write(const char *data, size_t len)
 {
@@ -407,7 +481,7 @@ void uart_parser_hw_init(void)
     EnableIRQ(APP_UART_IRQn);
 
     s_rd = 0U;
-    cmd_parser_init(&s_parser, uart_write);
+    cmd_parser_init(&s_parser, &s_io);
 }
 
 static inline uint32_t dma_write_index(void)
