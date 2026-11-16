@@ -33,6 +33,12 @@
 #define APP_INJECT_SEND_IMMEDIATE   1
 
 /* ------------------------------------------------------------------------- */
+/* Smooth move rendering (smooth_move.c)                                     */
+/* ------------------------------------------------------------------------- */
+#define APP_SMOOTH_TICK_HZ          8000U     /* one step per HS microframe   */
+#define APP_SMOOTH_MAX_MS           1000U     /* cmd.smooth() upper bound     */
+
+/* ------------------------------------------------------------------------- */
 /* USB device (USB1 / USB_OTG1 / kUSB_ControllerEhci0)                       */
 /* ------------------------------------------------------------------------- */
 /* PLACEHOLDER IDs - you must use a VID/PID you are entitled to use.         */
@@ -76,6 +82,7 @@
 /* ------------------------------------------------------------------------- */
 #define APP_NVIC_PRIO_USB_DEVICE    2U
 #define APP_NVIC_PRIO_USB_HOST      3U
+#define APP_NVIC_PRIO_SMOOTH_TICK   4U  /* PIT: below USB, above UART       */
 #define APP_NVIC_PRIO_UART          5U
 
 /*

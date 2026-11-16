@@ -12,6 +12,7 @@
 
 #include "hid_merge.h"
 #include "hid_report_parser.h"
+#include "smooth_move.h"
 #include "uart_parser.h"
 
 static int s_fail;
@@ -28,17 +29,22 @@ static int s_fail;
 /* ---- USB1 stub ---------------------------------------------------------- */
 static hid_mouse_report_t s_sent[64];
 static int s_nSent;
+static long s_sumX, s_sumY; /* total motion delivered to "the PC" */
 
 bool usb_device_send_report(const hid_mouse_report_t *r)
 {
     s_sent[s_nSent++ % 64] = *r;
+    s_sumX += r->x;
+    s_sumY += r->y;
     return true;
 }
 
 static void reset_usb(void)
 {
     s_nSent = 0;
+    s_sumX = s_sumY = 0;
     hid_merge_init();
+    smooth_move_init();
     hid_merge_set_device_ready(true);
 }
 
@@ -379,6 +385,131 @@ static void test_silent_ignore(void)
     CHECK(strcmp(s_out, "cmd.move(1,1)\r\n>>> cmd.left()\r\n0\r\n>>> ") == 0);
 }
 
+/* Run n ticks; record per-tick steps; complete each USB transfer. */
+static void run_ticks(int n, long *sx, long *sy, int32_t *stepsX)
+{
+    for (int i = 0; i < n; i++)
+    {
+        int32_t dx, dy;
+        smooth_move_tick(&dx, &dy);
+        if (stepsX != NULL)
+        {
+            stepsX[i] = dx;
+        }
+        *sx += dx;
+        *sy += dy;
+        hid_merge_on_tx_complete();
+    }
+}
+
+static void test_smooth_move(void)
+{
+    printf("smooth move: off by default, exact totals, eased profile\n");
+    reset_usb();
+
+    /* default off: instant, unchanged behaviour */
+    CHECK(smooth_move_get_duration() == 0);
+    CHECK(strcmp(run_cmd("cmd.smooth()"), "cmd.smooth()\r\n0\r\n>>> ") == 0);
+    run_cmd("cmd.move(10,0)");
+    CHECK(s_nSent == 1 && s_sent[0].x == 10);
+    hid_merge_on_tx_complete();
+    int32_t dx, dy;
+    smooth_move_tick(&dx, &dy);
+    CHECK(dx == 0 && dy == 0); /* idle tick does nothing */
+
+    /* 10 ms @ 8 kHz = 80 ticks */
+    CHECK(strcmp(run_cmd("cmd.smooth(10)"), "cmd.smooth(10)\r\n>>> ") == 0);
+    CHECK(strcmp(run_cmd("cmd.smooth()"), "cmd.smooth()\r\n10\r\n>>> ") == 0);
+    reset_usb();
+    smooth_move_set_duration(10);
+    int n0 = s_nSent;
+    run_cmd("cmd.move(1000,-370)");
+    CHECK(s_nSent == n0); /* nothing sent until ticks run */
+    CHECK(smooth_move_busy());
+
+    static int32_t steps[200];
+    long sx = 0, sy = 0;
+    run_ticks(80, &sx, &sy, steps);
+    CHECK(sx == 1000 && sy == -370);
+    CHECK(s_sumX == 1000 && s_sumY == -370);
+    CHECK(!smooth_move_busy());
+
+    /* accelerate then decelerate: ends slow, middle fast, never backwards */
+    int32_t maxStep = 0;
+    int maxAt       = 0;
+    for (int i = 0; i < 80; i++)
+    {
+        CHECK(steps[i] >= 0);
+        if (steps[i] > maxStep)
+        {
+            maxStep = steps[i];
+            maxAt   = i;
+        }
+    }
+    CHECK(steps[0] <= 2 && steps[79] <= 2);
+    CHECK(maxAt >= 30 && maxAt <= 50);
+    CHECK(maxStep >= 15 && maxStep <= 25); /* peak ~1.5x average (12.5) */
+
+    long zx = 0, zy = 0;
+    run_ticks(10, &zx, &zy, NULL);
+    CHECK(zx == 0 && zy == 0); /* finished: back to passthrough */
+
+    /* tiny and huge moves stay exact */
+    sx = sy = 0;
+    smooth_move_start(1, -1);
+    run_ticks(80, &sx, &sy, NULL);
+    CHECK(sx == 1 && sy == -1);
+    smooth_move_set_duration(1); /* 8 ticks */
+    sx = sy = 0;
+    smooth_move_start(70000, -3);
+    run_ticks(8, &sx, &sy, NULL);
+    CHECK(sx == 70000 && sy == -3);
+
+    /* sequential moves run back to back */
+    smooth_move_set_duration(5); /* 40 ticks */
+    sx = sy = 0;
+    smooth_move_start(100, 0);
+    smooth_move_start(-30, 50);
+    run_ticks(40, &sx, &sy, NULL);
+    CHECK(sx == 100 && sy == 0);
+    run_ticks(40, &sx, &sy, NULL);
+    CHECK(sx == 70 && sy == 50 && !smooth_move_busy());
+
+    /* queue overflow merges instead of dropping */
+    sx = sy = 0;
+    for (int i = 0; i < 40; i++)
+    {
+        smooth_move_start(3, 1);
+    }
+    run_ticks(40 * 40, &sx, &sy, NULL);
+    CHECK(sx == 120 && sy == 40 && !smooth_move_busy());
+}
+
+static void test_smooth_disable_flush(void)
+{
+    printf("smooth move: disabling mid-move flushes the remainder\n");
+    reset_usb();
+    smooth_move_set_duration(10);
+    smooth_move_start(1000, 200);
+    smooth_move_start(50, 0);
+    long sx = 0, sy = 0;
+    run_ticks(20, &sx, &sy, NULL);
+    CHECK(sx > 0 && sx < 1000);
+    run_cmd("cmd.smooth(0)");
+    for (int i = 0; i < 10; i++)
+    {
+        hid_merge_on_tx_complete();
+    }
+    CHECK(s_sumX == 1050 && s_sumY == 200);
+    CHECK(!smooth_move_busy());
+
+    /* out of range -> silently ignored, setting unchanged */
+    s_outLen = 0;
+    CHECK(cmd_execute_line("cmd.smooth(1001)", 16, &s_io) == 0 && s_outLen == 0);
+    CHECK(cmd_execute_line("cmd.smooth(-1)", 14, &s_io) == 0);
+    CHECK(smooth_move_get_duration() == 0);
+}
+
 int main(void)
 {
     test_button_locking();
@@ -391,6 +522,8 @@ int main(void)
     test_state_commands();
     test_utility_commands();
     test_silent_ignore();
+    test_smooth_move();
+    test_smooth_disable_flush();
     if (s_fail)
     {
         printf("%d check(s) FAILED\n", s_fail);

@@ -1,6 +1,6 @@
 SRC_DIR := ../source
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -O2 -DUNIT_TEST -I$(SRC_DIR)
-SRCS    := test_main.c $(SRC_DIR)/hid_merge.c $(SRC_DIR)/hid_report_parser.c $(SRC_DIR)/uart_parser.c
+SRCS    := test_main.c $(SRC_DIR)/hid_merge.c $(SRC_DIR)/hid_report_parser.c $(SRC_DIR)/uart_parser.c $(SRC_DIR)/smooth_move.c
 
 all: run
 

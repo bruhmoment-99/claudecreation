@@ -9,6 +9,7 @@
  * ----------------------------------
  *   USB_OTG1_IRQHandler   NVIC 2  USB1 device: ch9 + HID callbacks, re-prime IN EP
  *   USB_OTG2_IRQHandler   NVIC 3  USB2 host: signals the host stack task
+ *   PIT_IRQHandler        NVIC 4  8 kHz smooth-move tick (only while enabled)
  *   LPUART3_IRQHandler    NVIC 5  idle-line -> wakes UART task (RX itself is DMA)
  *   usbh_stack            prio 5  USB_HostEhciTaskFunction(); mouse IN callback ->
  *                                 parse -> merge -> USB_DeviceHidSend()
@@ -29,6 +30,7 @@
 #include "app_config.h"
 #include "board_init.h"
 #include "hid_merge.h"
+#include "smooth_move.h"
 #include "uart_parser.h"
 #include "usb_device_app.h"
 #include "usb_host_app.h"
@@ -46,10 +48,14 @@ static void app_init_task(void *arg)
      * as in the SDK's *_freertos examples.
      */
     hid_merge_init();
+    smooth_move_init(); /* OFF by default */
 
     /* USB1 to the PC: comes up first so the PC sees the mouse immediately,
      * even before a physical mouse is attached (injection-only operation). */
     usb_device_app_init();
+
+    /* PIT tick for smoothed moves (only runs while cmd.smooth(ms) > 0). */
+    smooth_move_hw_init();
 
     /* LPUART3 + eDMA ring. */
     uart_parser_hw_init();

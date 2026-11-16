@@ -11,6 +11,8 @@
  *     cmd.release()    clear every injected button
  *   Motion
  *     cmd.move(dx,dy)  cmd.wheel(delta)
+ *     cmd.smooth(ms)   render each move over ms milliseconds, 0 = off
+ *                      (default); query: cmd.smooth()
  *   Utility
  *     cmd.sleep(ms)    prompt is sent first, then the parser task sleeps
  *     cmd.version()    cmd.info()

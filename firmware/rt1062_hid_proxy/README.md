@@ -21,6 +21,7 @@ LPUART3 (CH343P, 6 Mbaud) get merged into the stream.
 | `source/usb_host.c` + `usb_host_app.h` | USB2 host: VBUS sequencing, interface claim, enumeration state machine, real-time IN callback, `USB_OTG2_IRQHandler` |
 | `source/hid_report_parser.c/.h` | Reads the mouse's report descriptor to find the buttons, X, Y and wheel fields (report IDs, 12-bit packed axes and so on) |
 | `source/hid_merge.c/.h` | Merges physical and injected input and handles button locking. It is the only code that builds the USB1 report |
+| `source/smooth_move.c/.h` | Optional eased rendering of `cmd.move`: a fixed-point smoothstep lookup table, a segment FIFO and an 8 kHz PIT tick. Off by default |
 | `source/uart_parser.c/.h` | Command grammar and responses (pure C) plus the LPUART3 eDMA ring driver and the parser task |
 | `source/app_config.h` | Priorities, sizes, VID/PID and behaviour switches. It includes no SDK headers |
 | `test/` | Unit tests that run on a PC for the merger, the descriptor parser and the command parser (`make -C test`) |
@@ -34,6 +35,7 @@ and `usb_host.h`.
 |---------|----------|------|
 | `USB_OTG1_IRQHandler` | NVIC 2 | USB1 device stack. When a send completes it calls `hid_merge_on_tx_complete()`, which re-primes EP1 IN |
 | `USB_OTG2_IRQHandler` | NVIC 3 | Signals the host stack task |
+| `PIT_IRQHandler` | NVIC 4 | Smooth-move tick at 8 kHz. Runs only while `cmd.smooth(ms)` > 0 |
 | `LPUART3_IRQHandler` | NVIC 5 | Idle-line interrupt wakes the UART task. Received bytes arrive by DMA |
 | `usbh_stack` task | 5 (highest) | `USB_HostEhciTaskFunction()`. Runs the mouse IN callback: re-arm, parse, merge, `USB_DeviceHidSend()` |
 | `usbh_app` task | 4 | VBUS LOW→HIGH, `USB_HostInit`, SET_INTERFACE / GET_DESCRIPTOR(Report) / SET_IDLE / SET_PROTOCOL, detach, VBUS fault |
@@ -107,7 +109,7 @@ and `.../host/ehci/usb_host_config.h` into your project and set:
 
 Add these SDK components: `usb_device_ehci`, `usb_device_hid`,
 `usb_device_ch9`, `usb_host_ehci`, `usb_host_hid`, `usb_phy`,
-`osa_free_rtos`, `lists`, `lpuart`, `edma`, `dmamux`, `igpio`, plus
+`osa_free_rtos`, `lists`, `lpuart`, `edma`, `dmamux`, `igpio`, `pit`, plus
 FreeRTOS (heap_4, ≥ 24 KB). Preprocessor: `CPU_MIMXRT1062DVJ6B`,
 `SDK_OS_FREE_RTOS`, `USE_RTOS=1`, `FSL_OSA_TASK_ENABLE=1`,
 `XIP_EXTERNAL_FLASH=1`, `DATA_SECTION_IS_CACHEABLE=1`.
@@ -149,6 +151,8 @@ name, bad or out-of-range arguments, or a line longer than 96 characters.
 | `cmd.buttons()` | Query | logical button byte |
 | `cmd.release()` | Clear every injected button | echo |
 | `cmd.move(dx,dy)` / `cmd.wheel(d)` | Add motion | echo |
+| `cmd.smooth(ms)` | Render each `cmd.move` over `ms` ms with ease-in/ease-out (0 = off, the default; max 1000) | echo |
+| `cmd.smooth()` | Query | current duration in ms |
 | `cmd.sleep(ms)` | Prompt goes out first, then the parser task sleeps (0–600000 ms) | echo |
 | `cmd.version()` / `cmd.info()` | | `1.0.0` / `HID-Proxy-RT1062` |
 
@@ -168,6 +172,19 @@ cmd.buttons()\r\n  ->  cmd.buttons()\r\n8\r\n>>>
 cmd.version()\r\n  ->  cmd.version()\r\n1.0.0\r\n>>> 
 cmd.left(2)\r\n    ->  (nothing)
 ```
+
+## Smoothed moves
+
+With `cmd.smooth(ms)` > 0, each `cmd.move(dx,dy)` is queued (16 segments;
+when the queue is full, a new move is merged into the last queued one) and
+played out over `ms` milliseconds. Position follows smoothstep
+`e(t) = 3t² − 2t³`, so velocity starts at zero, peaks mid-move and returns to
+zero at the target. The PIT tick recomputes the position from the curve on
+every tick rather than adding up rounded steps. The deltas of a segment
+therefore always sum to exactly `(dx, dy)`, and the output is deterministic.
+Turning smoothing off mid-move sends the remaining distance at once. The
+tuning points (duration, tick rate, curve table) are listed at the top of
+`smooth_move.c`.
 
 ## Verification status
 

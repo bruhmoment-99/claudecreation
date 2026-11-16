@@ -14,6 +14,7 @@
  */
 #include "uart_parser.h"
 #include "hid_merge.h"
+#include "smooth_move.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -34,6 +35,7 @@ typedef enum
     CMD_SLEEP,
     CMD_VERSION,
     CMD_INFO,
+    CMD_SMOOTH,
 } cmd_kind_t;
 
 typedef struct
@@ -56,6 +58,7 @@ static const cmd_def_t s_commands[] = {
     {"sleep", CMD_SLEEP, 0U},
     {"version", CMD_VERSION, 0U},
     {"info", CMD_INFO, 0U},
+    {"smooth", CMD_SMOOTH, 0U},
 };
 
 static void put_str(const cmd_io_t *io, const char *s)
@@ -235,7 +238,9 @@ int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
             {
                 return 0;
             }
-            hid_merge_inject_move(v[0], v[1]);
+            /* Instant when smoothing is off (default), else queued and
+             * rendered over cmd.smooth(ms) by the tick. */
+            smooth_move_start(v[0], v[1]);
             break;
 
         case CMD_WHEEL:
@@ -298,6 +303,22 @@ int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
             }
             doSleep = true;
             sleepMs = (uint32_t)v[0];
+            break;
+
+        case CMD_SMOOTH:
+            if (argc == 0)
+            {
+                numResult = true;
+                numValue  = smooth_move_get_duration();
+            }
+            else if ((argc == 1) && (v[0] >= 0) && ((uint32_t)v[0] <= APP_SMOOTH_MAX_MS))
+            {
+                smooth_move_set_duration((uint32_t)v[0]); /* 0 = off */
+            }
+            else
+            {
+                return 0;
+            }
             break;
 
         case CMD_VERSION:
