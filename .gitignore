@@ -3,3 +3,4 @@ config.json
 schematics/
 *.log
 mindcraft-setup/
+firmware/rt1062_hid_proxy/test/test_runner
