@@ -15,6 +15,7 @@
  *                                 parse -> merge -> USB_DeviceHidSend()
  *   usbh_app              prio 4  VBUS sequencing, enumeration, fault supervision
  *   uart_cmd              prio 3  command parser
+ *   status_led            prio 1  status LED pattern (app_status.h)
  *
  * The merge path never blocks and never waits for a task switch: the
  * physical report is decoded and the merged report is queued on USB1 inside
@@ -28,9 +29,11 @@
  *   configTOTAL_HEAP_SIZE                     >= 24 KB (USB stacks use OSA heap)
  */
 #include "app_config.h"
+#include "app_status.h"
 #include "board_init.h"
 #include "hid_merge.h"
 #include "smooth_move.h"
+#include "status_led.h"
 #include "uart_parser.h"
 #include "usb_device_app.h"
 #include "usb_host_app.h"
@@ -47,6 +50,7 @@ static void app_init_task(void *arg)
      * USB stacks create OSA/FreeRTOS objects and may take mutexes during init,
      * as in the SDK's *_freertos examples.
      */
+    app_status_init();
     hid_merge_init();
     smooth_move_init(); /* OFF by default */
 
@@ -60,6 +64,7 @@ static void app_init_task(void *arg)
     /* LPUART3 + eDMA ring. */
     uart_parser_hw_init();
 
+    (void)xTaskCreate(status_led_task, "status_led", APP_STACK_STATUS_LED, NULL, APP_PRIO_STATUS_LED, NULL);
     (void)xTaskCreate(uart_parser_task, "uart_cmd", APP_STACK_UART_PARSER, NULL, APP_PRIO_UART_PARSER, NULL);
 
     /* USB2 host: this task does VBUS LOW->HIGH, then USB_HostInit(), then
@@ -77,8 +82,6 @@ int main(void)
     (void)xTaskCreate(app_init_task, "init", APP_STACK_INIT, NULL, APP_PRIO_INIT, NULL);
     vTaskStartScheduler();
 
-    for (;;)
-    {
-        /* Only reached if the FreeRTOS heap is too small for the idle task. */
-    }
+    /* Only reached if the FreeRTOS heap is too small for the idle task. */
+    app_fatal(APP_FATAL_SCHEDULER);
 }

@@ -13,6 +13,7 @@
  *                      IDLE IRQ --notify--> uart_parser_task ----+ (reads)
  */
 #include "uart_parser.h"
+#include "app_status.h"
 #include "hid_merge.h"
 #include "smooth_move.h"
 
@@ -36,6 +37,7 @@ typedef enum
     CMD_VERSION,
     CMD_INFO,
     CMD_SMOOTH,
+    CMD_STATUS,
 } cmd_kind_t;
 
 typedef struct
@@ -59,6 +61,7 @@ static const cmd_def_t s_commands[] = {
     {"version", CMD_VERSION, 0U},
     {"info", CMD_INFO, 0U},
     {"smooth", CMD_SMOOTH, 0U},
+    {"status", CMD_STATUS, 0U},
 };
 
 static void put_str(const cmd_io_t *io, const char *s)
@@ -213,6 +216,7 @@ int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
     uint32_t numValue     = 0U;
     uint32_t sleepMs      = 0U;
     bool doSleep          = false;
+    bool doStatus         = false; /* status                     */
 
     while ((s < e) && is_space(*s))
     {
@@ -321,6 +325,14 @@ int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
             }
             break;
 
+        case CMD_STATUS:
+            if (argc != 0)
+            {
+                return 0;
+            }
+            doStatus = true;
+            break;
+
         case CMD_VERSION:
         case CMD_INFO:
             if (argc != 0)
@@ -345,6 +357,11 @@ int cmd_execute_line(const char *line, size_t len, const cmd_io_t *io)
     {
         put_str(io, "\r\n");
         put_uint(io, numValue);
+    }
+    else if (doStatus)
+    {
+        put_str(io, "\r\n");
+        app_status_print(app_status_get(), (io->now_ms != NULL) ? io->now_ms() : 0U, io->write);
     }
     put_str(io, "\r\n>>> ");
 
@@ -404,6 +421,7 @@ void cmd_parser_feed(cmd_parser_t *p, const uint8_t *data, size_t len)
 #include "fsl_edma.h"
 #include "fsl_dmamux.h"
 #include "board_init.h"
+#include "status_led.h"
 
 #define APP_UART            LPUART3
 #define APP_UART_IRQn       LPUART3_IRQn
@@ -425,7 +443,7 @@ static cmd_parser_t s_parser;
 static void uart_write(const char *data, size_t len);
 static void uart_sleep(uint32_t ms);
 
-static const cmd_io_t s_io = {uart_write, uart_sleep};
+static const cmd_io_t s_io = {uart_write, uart_sleep, app_now_ms};
 
 static void uart_sleep(uint32_t ms)
 {
@@ -468,9 +486,7 @@ void uart_parser_hw_init(void)
     cfg.rxIdleConfig = kLPUART_IdleCharacter2; /* 2 idle chars = 3.3 us */
     if (LPUART_Init(APP_UART, &cfg, board_uart_clock_hz()) != kStatus_Success)
     {
-        for (;;)
-        {
-        } /* baud rate not achievable - check clock root */
+        app_fatal(APP_FATAL_UART_INIT); /* baud rate not achievable - check clock root */
     }
 
     /* --- eDMA circular RX -------------------------------------------------- */

@@ -19,6 +19,7 @@
 #define APP_CMD_SLEEP_MAX_MS        600000U   /* cmd.sleep() upper bound      */
 #define APP_FW_VERSION              "1.0.0"
 #define APP_DEVICE_INFO             "HID-Proxy-RT1062"
+#define APP_LED_REFRESH_MS          20U       /* status LED update period     */
 
 /* ------------------------------------------------------------------------- */
 /* Injection behaviour                                                       */
@@ -66,11 +67,13 @@
 #define APP_PRIO_INIT               5U  /* one-shot bring-up task             */
 #define APP_PRIO_USB_HOST_APP       4U  /* enumeration state machine          */
 #define APP_PRIO_UART_PARSER        3U  /* command parser (medium)            */
+#define APP_PRIO_STATUS_LED         1U  /* status LED (lowest)                */
 
 #define APP_STACK_USB_HOST_STACK    1024U  /* words */
 #define APP_STACK_USB_HOST_APP      1024U
 #define APP_STACK_UART_PARSER       768U
 #define APP_STACK_INIT              768U
+#define APP_STACK_STATUS_LED        256U
 
 /* ------------------------------------------------------------------------- */
 /* NVIC priorities (0 = highest). configPRIO_BITS = 4 on RT1062.             */

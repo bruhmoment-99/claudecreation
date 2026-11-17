@@ -4,3 +4,5 @@ schematics/
 *.log
 mindcraft-setup/
 firmware/rt1062_hid_proxy/test/test_runner
+firmware/rt1062_hid_proxy/sdk/
+firmware/rt1062_hid_proxy/build*/

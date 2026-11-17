@@ -3,6 +3,7 @@
  *   hid_merge.c          (button locking, accumulation, splitting)
  *   hid_report_parser.c  (dynamic report layout discovery)
  *   uart_parser.c        (command grammar + response protocol)
+ *   app_status.c         (status LED patterns, cmd.status() text)
  *
  * Build & run:  make -C test
  */
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app_status.h"
 #include "hid_merge.h"
 #include "hid_report_parser.h"
 #include "smooth_move.h"
@@ -70,7 +72,12 @@ static void cap_sleep(uint32_t ms)
     s_sleptMs = ms;
     memcpy(s_outAtSleep, s_out, s_outLen + 1);
 }
-static const cmd_io_t s_io = {cap_write, cap_sleep};
+static uint32_t s_nowMs;
+static uint32_t cap_now(void)
+{
+    return s_nowMs;
+}
+static const cmd_io_t s_io = {cap_write, cap_sleep, cap_now};
 
 static const char *run_cmd(const char *line)
 {
@@ -510,6 +517,155 @@ static void test_smooth_disable_flush(void)
     CHECK(smooth_move_get_duration() == 0);
 }
 
+/* The gaming mouse descriptor from test_parser_gaming(). */
+static const uint8_t s_gamingDesc[] = {
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0,
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x95, 0x10, 0x75, 0x01, 0x81, 0x02,
+    0x05, 0x01, 0x16, 0x01, 0xF8, 0x26, 0xFF, 0x07, 0x75, 0x0C, 0x95, 0x02, 0x09, 0x30, 0x09, 0x31,
+    0x81, 0x06,
+    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06,
+    0xC0, 0xC0};
+
+static void test_status_command(void)
+{
+    printf("cmd.status(): links, mouse, layout, faults\n");
+    reset_usb();
+    app_status_init();
+    s_nowMs = 1000U;
+
+    /* fresh boot: nothing connected */
+    CHECK(strcmp(run_cmd("cmd.status()"), "cmd.status()\r\n"
+                                          "pc: not-configured reports=0\r\n"
+                                          "mouse: none\r\n"
+                                          "layout: -\r\n"
+                                          "faults: none\r\n>>> ") == 0);
+
+    /* PC enumerated us at high speed, a full-speed gaming mouse is streaming */
+    app_status_pc_speed(APP_USB_SPEED_HIGH);
+    app_status_pc_configured(true);
+    app_status_pc_report_sent();
+    app_status_pc_report_sent();
+    app_status_mouse_attached(0x046DU, 0xC08BU, APP_USB_SPEED_FULL, 1U);
+    CHECK(strstr(run_cmd("cmd.status()"), "mouse: enumerating full-speed vid=046d pid=c08b interface=1\r\n"
+                                          "layout: -\r\n") != NULL);
+    hid_mouse_layout_t l;
+    CHECK(hid_parse_mouse_layout(s_gamingDesc, sizeof(s_gamingDesc), &l));
+    app_status_mouse_ready(&l, false, 8U);
+    app_status_mouse_report();
+    app_status_mouse_report();
+    app_status_mouse_report();
+    CHECK(strcmp(run_cmd("cmd.status()"),
+                 "cmd.status()\r\n"
+                 "pc: configured high-speed reports=2\r\n"
+                 "mouse: ready full-speed vid=046d pid=c08b interface=1 packet=8 reports=3\r\n"
+                 "layout: report-id=2 buttons=8(0xff)@0 x=s12@16 y=s12@28 wheel=s8@40\r\n"
+                 "faults: none\r\n>>> ") == 0);
+
+    /* boot-protocol fallback layout, no report IDs, no wheel */
+    hid_mouse_layout_boot(&l);
+    app_status_mouse_ready(&l, true, 4U);
+    CHECK(strstr(run_cmd("cmd.status()"), "layout: boot buttons=3(0x07)@0 x=s8@8 y=s8@16 wheel=none\r\n") !=
+          NULL);
+
+    /* failures */
+    app_status_mouse_error("no mouse collection in report descriptor");
+    CHECK(strstr(run_cmd("cmd.status()"),
+                 "mouse: error (no mouse collection in report descriptor) full-speed vid=046d pid=c08b interface=1\r\n"
+                 "layout: -\r\n"
+                 "faults: mouse-error\r\n") != NULL);
+    app_status_mouse_detached();
+    app_status_mouse_unsupported(0x1234U, 0xABCDU, APP_USB_SPEED_HIGH);
+    app_status_vbus_fault(500U);
+    app_status_vbus_fault(900U);
+    CHECK(strstr(run_cmd("cmd.status()"), "mouse: unsupported high-speed vid=1234 pid=abcd\r\n"
+                                          "layout: -\r\n"
+                                          "faults: vbus-overcurrent=2(active) unsupported-device\r\n>>> ") != NULL);
+    s_nowMs = 900U + APP_STATUS_VBUS_FAULT_HOLD_MS;
+    app_status_mouse_detached();
+    app_status_host_init_failed();
+    CHECK(strstr(run_cmd("cmd.status()"), "faults: host-init-failed vbus-overcurrent=2\r\n>>> ") != NULL);
+
+    /* takes no arguments; no clock is fine */
+    s_outLen = 0;
+    CHECK(cmd_execute_line("cmd.status(1)", 13, &s_io) == 0 && s_outLen == 0);
+    static const cmd_io_t noClock = {cap_write, cap_sleep, NULL};
+    s_outLen = 0;
+    CHECK(cmd_execute_line("cmd.status()", 12, &noClock) == 1);
+    app_status_init();
+}
+
+/* Sample the LED every 10 ms over 2 s from t0; count lit samples and
+ * off->on edges. */
+static void led_profile(const app_status_t *st, uint32_t t0, int *lit, int *edges)
+{
+    bool prev = app_status_led_on(st, t0 - 10U);
+    *lit      = 0;
+    *edges    = 0;
+    for (uint32_t t = t0; t < t0 + 2000U; t += 10U)
+    {
+        bool on = app_status_led_on(st, t);
+        *lit += on ? 1 : 0;
+        *edges += (on && !prev) ? 1 : 0;
+        prev = on;
+    }
+}
+
+static void test_status_led(void)
+{
+    printf("status LED patterns\n");
+    app_status_init();
+    const app_status_t *st = app_status_get();
+    int lit, edges;
+    hid_mouse_layout_t l;
+    hid_mouse_layout_boot(&l);
+
+    /* idle: one short blip per 2 s */
+    led_profile(st, 10000U, &lit, &edges);
+    CHECK(edges == 1 && lit == 6);
+
+    /* mouse but no PC: two blips */
+    app_status_mouse_attached(1U, 2U, APP_USB_SPEED_FULL, 0U);
+    app_status_mouse_ready(&l, true, 4U);
+    led_profile(st, 10000U, &lit, &edges);
+    CHECK(edges == 2 && lit == 12);
+
+    /* PC + mouse: solid */
+    app_status_pc_configured(true);
+    led_profile(st, 10000U, &lit, &edges);
+    CHECK(edges == 0 && lit == 200);
+
+    /* PC, no mouse: 1 Hz */
+    app_status_mouse_detached();
+    led_profile(st, 10000U, &lit, &edges);
+    CHECK(edges == 2 && lit == 100);
+    CHECK(!app_status_has_fault(st, 10000U));
+
+    /* VBUS fault: 5 Hz for the hold time, then back to 1 Hz */
+    app_status_vbus_fault(10000U);
+    CHECK(app_status_has_fault(st, 10000U));
+    led_profile(st, 10000U, &lit, &edges);
+    CHECK(edges == 10 && lit == 100);
+    CHECK(!app_status_has_fault(st, 10000U + APP_STATUS_VBUS_FAULT_HOLD_MS));
+    led_profile(st, 10000U + APP_STATUS_VBUS_FAULT_HOLD_MS, &lit, &edges);
+    CHECK(edges == 2);
+
+    /* fault time near the 32-bit wrap */
+    app_status_vbus_fault(0xFFFFFF00U);
+    CHECK(app_status_has_fault(st, 0x00000100U));
+
+    /* mouse errors are faults too */
+    app_status_init();
+    app_status_mouse_error("x");
+    CHECK(app_status_has_fault(st, 0U));
+    app_status_mouse_unsupported(1U, 2U, APP_USB_SPEED_LOW);
+    CHECK(app_status_has_fault(st, 0U));
+    app_status_mouse_attached(1U, 2U, APP_USB_SPEED_LOW, 0U); /* next device clears it */
+    CHECK(!app_status_has_fault(st, 0U));
+    app_status_init();
+}
+
 int main(void)
 {
     test_button_locking();
@@ -524,6 +680,8 @@ int main(void)
     test_silent_ignore();
     test_smooth_move();
     test_smooth_disable_flush();
+    test_status_command();
+    test_status_led();
     if (s_fail)
     {
         printf("%d check(s) FAILED\n", s_fail);

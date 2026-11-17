@@ -16,6 +16,8 @@
  *   Utility
  *     cmd.sleep(ms)    prompt is sent first, then the parser task sleeps
  *     cmd.version()    cmd.info()
+ *     cmd.status()     link speed, mouse, parsed report layout, faults
+ *                      (four lines, see app_status_print())
  *
  * Every button change goes through hid_merge, so the button locking rule
  * applies: a report is sent only if (physical | injected) actually changes.
@@ -23,7 +25,8 @@
  * Responses
  *     command : "<echo>\r\n>>> "
  *     query   : "<echo>\r\n<value>\r\n>>> "   (button queries report the
- *               logical state = physical | injected; version/info a string)
+ *               logical state = physical | injected; version/info a string;
+ *               status several "\r\n"-separated lines)
  *     invalid : nothing at all (unknown name, bad arguments, overlong line)
  */
 #ifndef UART_PARSER_H_
@@ -38,6 +41,8 @@ typedef struct
 {
     void (*write)(const char *data, size_t len); /* response output          */
     void (*sleep_ms)(uint32_t ms);               /* blocks the calling task  */
+    uint32_t (*now_ms)(void);                    /* ms clock for cmd.status, */
+                                                 /* may be NULL              */
 } cmd_io_t;
 
 typedef struct

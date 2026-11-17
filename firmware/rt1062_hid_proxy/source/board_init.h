@@ -19,4 +19,7 @@ void board_vbus_enable(bool on);
 /* AP2553W6 FLG pin (open drain, active low): true = over-current/thermal fault. */
 bool board_vbus_fault(void);
 
+/* Status LED (see app_status.h for the patterns). true = lit. */
+void board_led_set(bool on);
+
 #endif /* BOARD_INIT_H_ */

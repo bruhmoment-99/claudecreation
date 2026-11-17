@@ -11,6 +11,9 @@
  *   CH343P TXD  ->      GPIO_AD_B1_07   ALT2  LPUART3_RX
  *   AP2553 EN           GPIO_AD_B1_10   ALT5  GPIO1_IO26 (output)
  *   AP2553 FLG          GPIO_AD_B1_11   ALT5  GPIO1_IO27 (input, pull-up)
+ *   Status LED          GPIO_AD_B0_09   ALT5  GPIO1_IO09 (output; the user
+ *                                             LED on the i.MX RT1060 EVK,
+ *                                             active low there)
  *   USB1 D+/D-/VBUS     dedicated USB_OTG1 pins (no mux needed)
  *   USB2 D+/D-          dedicated USB_OTG2 pins (no mux needed)
  */
@@ -27,6 +30,12 @@
 #define VBUS_EN_PIN    26U
 #define VBUS_FLG_GPIO  GPIO1
 #define VBUS_FLG_PIN   27U
+#define LED_GPIO       GPIO1
+#define LED_PIN        9U
+/* 1 if the LED lights when the pin is high, 0 if it lights when low. */
+#ifndef BOARD_LED_ACTIVE_HIGH
+#define BOARD_LED_ACTIVE_HIGH 0
+#endif
 
 /* Pad control helpers (IOMUXC_SW_PAD_CTL_PAD_*). */
 #define PAD_UART_FAST                                                                     \
@@ -44,6 +53,8 @@
 #define PAD_GPIO_IN_PULLUP                                                                \
     (IOMUXC_SW_PAD_CTL_PAD_HYS(1U) | IOMUXC_SW_PAD_CTL_PAD_PKE(1U) |                       \
      IOMUXC_SW_PAD_CTL_PAD_PUE(1U) | IOMUXC_SW_PAD_CTL_PAD_PUS(2U))
+
+#define PAD_LED (IOMUXC_SW_PAD_CTL_PAD_DSE(6U) | IOMUXC_SW_PAD_CTL_PAD_SPEED(1U))
 
 static void board_init_uart_clock(void)
 {
@@ -85,6 +96,10 @@ static void board_init_pins(void)
 
     IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B1_11_GPIO1_IO27, PAD_GPIO_IN_PULLUP);
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B1_11_GPIO1_IO27, 0U);
+
+    /* Status LED */
+    IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, 0U);
+    IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, PAD_LED);
 }
 
 static void board_init_vbus_gpio(void)
@@ -95,6 +110,11 @@ static void board_init_vbus_gpio(void)
 
     gpio_pin_config_t in = {kGPIO_DigitalInput, 0U, kGPIO_NoIntmode};
     GPIO_PinInit(VBUS_FLG_GPIO, VBUS_FLG_PIN, &in);
+
+    /* LED lit from reset until the status task takes over: shows that the
+     * image booted and reached board_init(). */
+    gpio_pin_config_t led = {kGPIO_DigitalOutput, BOARD_LED_ACTIVE_HIGH ? 1U : 0U, kGPIO_NoIntmode};
+    GPIO_PinInit(LED_GPIO, LED_PIN, &led);
 }
 
 void board_init(void)
@@ -111,7 +131,7 @@ void board_init(void)
 
     board_init_uart_clock();
     board_init_pins();
-    board_init_vbus_gpio(); /* VBUS to USB-A port OFF until host init */
+    board_init_vbus_gpio(); /* VBUS to USB-A port OFF until host init; LED on */
 }
 
 void board_vbus_enable(bool on)
@@ -122,4 +142,9 @@ void board_vbus_enable(bool on)
 bool board_vbus_fault(void)
 {
     return GPIO_PinRead(VBUS_FLG_GPIO, VBUS_FLG_PIN) == 0U;
+}
+
+void board_led_set(bool on)
+{
+    GPIO_PinWrite(LED_GPIO, LED_PIN, (on == (BOARD_LED_ACTIVE_HIGH != 0)) ? 1U : 0U);
 }

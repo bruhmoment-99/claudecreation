@@ -32,6 +32,8 @@
  */
 #include "usb_device_app.h"
 #include "app_config.h"
+#include "app_status.h"
+#include "status_led.h"
 
 #include <string.h>
 
@@ -44,6 +46,10 @@
 #include "usb_device_hid.h"
 #include "usb_device_ch9.h"
 #include "usb_phy.h"
+
+_Static_assert((USB_SPEED_FULL == APP_USB_SPEED_FULL) && (USB_SPEED_LOW == APP_USB_SPEED_LOW) &&
+                   (USB_SPEED_HIGH == APP_USB_SPEED_HIGH),
+               "app_status speed codes must match the SDK");
 
 #define CONTROLLER_ID       kUSB_ControllerEhci0
 #define USB_DEVICE_IRQn     USB_OTG1_IRQn
@@ -290,7 +296,12 @@ APP_HOT bool usb_device_send_report(const hid_mouse_report_t *report)
     /* hid_merge guarantees no transfer is pending when we get here, so the
      * buffer is not owned by the controller. */
     memcpy(s_txBuffer, report, sizeof(*report));
-    return USB_DeviceHidSend(s_hidHandle, APP_HID_IN_EP, s_txBuffer, sizeof(*report)) == kStatus_USB_Success;
+    if (USB_DeviceHidSend(s_hidHandle, APP_HID_IN_EP, s_txBuffer, sizeof(*report)) != kStatus_USB_Success)
+    {
+        return false;
+    }
+    app_status_pc_report_sent();
+    return true;
 }
 
 /* ========================================================================= */
@@ -310,6 +321,7 @@ static void usb_device_set_speed(uint8_t speed)
     s_hidEndpoints[0].maxPacketSize = APP_HID_IN_MPS;
     s_hidEndpoints[0].interval      = interval;
     s_speed                         = speed;
+    app_status_pc_speed(speed);
 }
 
 /* ========================================================================= */
@@ -369,6 +381,7 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
             uint8_t speed           = USB_SPEED_FULL;
             s_currentConfiguration  = 0U;
             hid_merge_set_device_ready(false);
+            app_status_pc_configured(false);
             /* After the HS chirp handshake the controller knows the speed. */
             if (USB_DeviceClassGetSpeed(CONTROLLER_ID, &speed) == kStatus_USB_Success)
             {
@@ -382,6 +395,7 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
         case kUSB_DeviceEventDetach:
             s_currentConfiguration = 0U;
             hid_merge_set_device_ready(false);
+            app_status_pc_configured(false);
             status = kStatus_USB_Success;
             break;
 #endif
@@ -391,6 +405,7 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
             {
                 s_currentConfiguration = 0U;
                 hid_merge_set_device_ready(false);
+                app_status_pc_configured(false);
                 status = kStatus_USB_Success;
             }
             else if (*temp8 == USB_HID_MOUSE_CONFIGURE_INDEX)
@@ -398,6 +413,7 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
                 /* The class driver has opened EP1 IN by now. */
                 s_currentConfiguration = *temp8;
                 hid_merge_set_device_ready(true);
+                app_status_pc_configured(true);
                 status = kStatus_USB_Success;
             }
             break;
@@ -558,9 +574,7 @@ void usb_device_app_init(void)
      * allocates the EHCI device controller (dQH/dTD in non-cacheable RAM). */
     if (USB_DeviceClassInit(CONTROLLER_ID, &s_classConfigList, &s_deviceHandle) != kStatus_USB_Success)
     {
-        for (;;)
-        {
-        }
+        app_fatal(APP_FATAL_USB_DEVICE_INIT);
     }
     s_hidHandle = s_classConfigList.config->classHandle;
 
