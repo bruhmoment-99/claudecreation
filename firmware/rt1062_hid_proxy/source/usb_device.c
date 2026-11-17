@@ -21,22 +21,44 @@
  *   - no code masks interrupts for long (hid_merge locks are < 1 us),
  *   - optionally the ISR path runs from ITCM (see APP_HOT in app_config.h).
  *
- * Required usb_device_config.h settings (copy the SDK template and set):
+ * Boot protocol (BIOS/UEFI)
+ * ------------------------
+ * The interface is a boot mouse (subclass 1, protocol 2). Operating systems
+ * use report protocol (the default) and get the full 8-byte report below.
+ * Firmware that sends SET_PROTOCOL(boot) gets the 3-byte boot report
+ * (buttons 1-8, X, Y as int8); hid_merge splits larger motion and drops the
+ * wheel while boot protocol is active.
+ *
+ * Suspend and remote wake-up
+ * --------------------------
+ * When the PC suspends the bus (sleep), reports stop and motion is dropped.
+ * If the PC enabled remote wake-up (SET_FEATURE DEVICE_REMOTE_WAKEUP, which
+ * the SDK's ch9 code records), a new button press - physical or injected -
+ * makes usb_device_poll() drive resume signalling for APP_RESUME_SIGNAL_MS.
+ * Resume is detected by polling the port's SUSP bit. The board keeps
+ * drawing its normal current while suspended (USB allows 2.5 mA); PCs do
+ * not enforce that, but a strictly compliant hub could.
+ *
+ * Required usb_device_config.h settings (config/usb_device_config.h):
  *   USB_DEVICE_CONFIG_EHCI            1U
  *   USB_DEVICE_CONFIG_HID             1U
  *   USB_DEVICE_CONFIG_ENDPOINTS       4U
  *   USB_DEVICE_CONFIG_USE_TASK        0U   (callbacks run in the ISR)
  *   USB_DEVICE_CONFIG_MAX_MESSAGES    8U
  *   USB_DEVICE_CONFIG_SELF_POWER      0U
- *   USB_DEVICE_CONFIG_REMOTE_WAKEUP   0U
+ *   USB_DEVICE_CONFIG_LOW_POWER_MODE  1U   (suspend notification)
+ *   USB_DEVICE_CONFIG_REMOTE_WAKEUP   1U   (SET_FEATURE remote wake-up)
  */
 #include "usb_device_app.h"
 #include "app_config.h"
+#include "hid_merge.h"
 #include "app_status.h"
 #include "status_led.h"
 
 #include <string.h>
 
+#include "FreeRTOS.h"
+#include "task.h"
 #include "fsl_device_registers.h"
 #include "board.h" /* BOARD_XTAL0_CLK_HZ, BOARD_USB_PHY_* calibration values */
 #include "usb_device_config.h"
@@ -78,8 +100,11 @@ _Static_assert((USB_SPEED_FULL == APP_USB_SPEED_FULL) && (USB_SPEED_LOW == APP_U
 #define USB_HID_CLASS                   USB_DEVICE_CONFIG_HID_CLASS_CODE /* 0x03 */
 
 /*
- * Report descriptor: 8 buttons, 16-bit relative X/Y, 8-bit relative wheel.
- * Must match hid_mouse_report_t (6 bytes, no report ID).
+ * Report descriptor: 16 buttons, 16-bit relative X/Y, 8-bit vertical wheel,
+ * 8-bit horizontal scroll (AC Pan). Must match hid_mouse_report_t (8 bytes,
+ * no report ID). The first three bytes' meaning (buttons 1-8, then X and Y)
+ * differs from the boot report only in the axis width, which is why boot
+ * protocol gets its own 3-byte encoding in usb_device_send_report().
  */
 USB_DMA_INIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
 static uint8_t s_hidReportDescriptor[] = {
@@ -90,12 +115,12 @@ static uint8_t s_hidReportDescriptor[] = {
     0xA1, 0x00,       /*   Collection (Physical)                 */
     0x05, 0x09,       /*     Usage Page (Button)                 */
     0x19, 0x01,       /*     Usage Minimum (1)                   */
-    0x29, 0x08,       /*     Usage Maximum (8)                   */
+    0x29, 0x10,       /*     Usage Maximum (16)                  */
     0x15, 0x00,       /*     Logical Minimum (0)                 */
     0x25, 0x01,       /*     Logical Maximum (1)                 */
-    0x95, 0x08,       /*     Report Count (8)                    */
+    0x95, 0x10,       /*     Report Count (16)                   */
     0x75, 0x01,       /*     Report Size (1)                     */
-    0x81, 0x02,       /*     Input (Data,Var,Abs)   -> byte 0    */
+    0x81, 0x02,       /*     Input (Data,Var,Abs)   -> bytes 0-1 */
     0x05, 0x01,       /*     Usage Page (Generic Desktop)        */
     0x09, 0x30,       /*     Usage (X)                           */
     0x09, 0x31,       /*     Usage (Y)                           */
@@ -103,19 +128,23 @@ static uint8_t s_hidReportDescriptor[] = {
     0x26, 0xFF, 0x7F, /*     Logical Maximum (32767)             */
     0x75, 0x10,       /*     Report Size (16)                    */
     0x95, 0x02,       /*     Report Count (2)                    */
-    0x81, 0x06,       /*     Input (Data,Var,Rel)   -> bytes 1-4 */
+    0x81, 0x06,       /*     Input (Data,Var,Rel)   -> bytes 2-5 */
     0x09, 0x38,       /*     Usage (Wheel)                       */
     0x15, 0x81,       /*     Logical Minimum (-127)              */
     0x25, 0x7F,       /*     Logical Maximum (127)               */
     0x75, 0x08,       /*     Report Size (8)                     */
     0x95, 0x01,       /*     Report Count (1)                    */
-    0x81, 0x06,       /*     Input (Data,Var,Rel)   -> byte 5    */
+    0x81, 0x06,       /*     Input (Data,Var,Rel)   -> byte 6    */
+    0x05, 0x0C,       /*     Usage Page (Consumer)               */
+    0x0A, 0x38, 0x02, /*     Usage (AC Pan)                      */
+    0x95, 0x01,       /*     Report Count (1)                    */
+    0x81, 0x06,       /*     Input (Data,Var,Rel)   -> byte 7    */
     0xC0,             /*   End Collection                        */
     0xC0,             /* End Collection                          */
 };
 #define HID_REPORT_DESC_LEN (sizeof(s_hidReportDescriptor))
-_Static_assert(sizeof(hid_mouse_report_t) == 6U, "report struct must be 6 bytes");
-_Static_assert(sizeof(hid_mouse_report_t) <= APP_HID_IN_MPS, "report exceeds wMaxPacketSize");
+_Static_assert(sizeof(hid_mouse_report_t) == 8U, "report struct must be 8 bytes");
+_Static_assert(sizeof(hid_mouse_report_t) < APP_HID_IN_MPS, "report must be a short packet");
 
 USB_DMA_INIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
 static uint8_t s_deviceDescriptor[] = {
@@ -157,21 +186,19 @@ static uint8_t s_configDescriptor[CONFIG_DESC_TOTAL_LEN] = {
     USB_HID_MOUSE_INTERFACE_COUNT,
     USB_HID_MOUSE_CONFIGURE_INDEX,
     0x00,       /* iConfiguration */
-    0x80,       /* bmAttributes: bus powered (D7 must be 1) */
+    0xA0,       /* bmAttributes: bus powered (D7 must be 1), remote wake-up */
     0xFA,       /* bMaxPower: 500 mA (board + downstream mouse) */
 
-    /* Interface 0: HID. Subclass 0 / protocol 0 (no boot interface) because the
-     * 16-bit report is not boot compatible. To support BIOS boot protocol use
-     * subclass 1 / protocol 2 and send a 3-byte boot report while
-     * SET_PROTOCOL(0) is in effect. */
+    /* Interface 0: HID boot mouse. Report protocol (default) uses the 8-byte
+     * report; boot protocol (BIOS/UEFI) the 3-byte boot report. */
     USB_DESCRIPTOR_LENGTH_INTERFACE,
     USB_DESCRIPTOR_TYPE_INTERFACE,
     USB_HID_MOUSE_INTERFACE_INDEX,
     0x00, /* bAlternateSetting */
     USB_HID_MOUSE_ENDPOINT_COUNT,
     USB_HID_CLASS,     /* 0x03 */
-    0x00,              /* bInterfaceSubClass: none */
-    0x00,              /* bInterfaceProtocol: none */
+    0x01,              /* bInterfaceSubClass: boot interface */
+    0x02,              /* bInterfaceProtocol: mouse */
     0x00,
 
     /* HID descriptor */
@@ -279,6 +306,10 @@ static class_handle_t s_hidHandle;
 static volatile uint8_t s_currentConfiguration;
 static uint8_t s_currentAltSetting;
 static volatile uint8_t s_speed = USB_SPEED_FULL;
+static volatile bool s_bootProtocol;   /* SET_PROTOCOL(0) in effect      */
+static volatile bool s_suspended;      /* bus suspended by the PC        */
+static volatile bool s_wakeRequested;  /* button pressed while suspended */
+static uint32_t s_lastWakeMs;
 
 /* IN transfer buffer: the controller DMAs from here -> non-cacheable RAM. */
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_txBuffer[APP_HID_IN_MPS];
@@ -295,8 +326,22 @@ APP_HOT bool usb_device_send_report(const hid_mouse_report_t *report)
     }
     /* hid_merge guarantees no transfer is pending when we get here, so the
      * buffer is not owned by the controller. */
-    memcpy(s_txBuffer, report, sizeof(*report));
-    if (USB_DeviceHidSend(s_hidHandle, APP_HID_IN_EP, s_txBuffer, sizeof(*report)) != kStatus_USB_Success)
+    uint32_t len;
+    if (s_bootProtocol)
+    {
+        /* Boot report (HID 1.11 B.2): buttons, X, Y as int8. hid_merge has
+         * already limited X/Y to +-127. */
+        s_txBuffer[0] = (uint8_t)(report->buttons & 0xFFU);
+        s_txBuffer[1] = (uint8_t)(int8_t)report->x;
+        s_txBuffer[2] = (uint8_t)(int8_t)report->y;
+        len           = 3U;
+    }
+    else
+    {
+        memcpy(s_txBuffer, report, sizeof(*report));
+        len = sizeof(*report);
+    }
+    if (USB_DeviceHidSend(s_hidHandle, APP_HID_IN_EP, s_txBuffer, len) != kStatus_USB_Success)
     {
         return false;
     }
@@ -352,10 +397,19 @@ static APP_HOT usb_status_t usb_device_hid_callback(class_handle_t handle, uint3
         case kUSB_DeviceHidEventRequestReportBuffer:
             status = kStatus_USB_InvalidRequest; /* STALL: not supported */
             break;
+        case kUSB_DeviceHidEventSetProtocol:
+        {
+            /* 0 = boot, 1 = report. The class stores the value for
+             * GET_PROTOCOL itself. */
+            bool boot      = (param != NULL) && (*(uint8_t *)param == 0U);
+            s_bootProtocol = boot;
+            hid_merge_set_boot_protocol(boot);
+            app_status_pc_boot_protocol(boot);
+            break;
+        }
         case kUSB_DeviceHidEventGetIdle:
         case kUSB_DeviceHidEventGetProtocol:
         case kUSB_DeviceHidEventSetIdle:
-        case kUSB_DeviceHidEventSetProtocol:
             break;
         default:
             status = kStatus_USB_InvalidRequest;
@@ -380,8 +434,12 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
         {
             uint8_t speed           = USB_SPEED_FULL;
             s_currentConfiguration  = 0U;
+            s_bootProtocol          = false; /* report protocol after reset */
+            s_suspended             = false;
             hid_merge_set_device_ready(false);
             app_status_pc_configured(false);
+            app_status_pc_boot_protocol(false);
+            app_status_pc_suspended(false);
             /* After the HS chirp handshake the controller knows the speed. */
             if (USB_DeviceClassGetSpeed(CONTROLLER_ID, &speed) == kStatus_USB_Success)
             {
@@ -399,6 +457,20 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
             status = kStatus_USB_Success;
             break;
 #endif
+
+        case kUSB_DeviceEventSuspend:
+            /* No SOF for 3 ms: the PC is going to sleep (or was unplugged
+             * while we stay powered). Resume is detected in
+             * usb_device_poll(). */
+            s_suspended = true;
+            hid_merge_set_suspended(true);
+            app_status_pc_suspended(true);
+            status = kStatus_USB_Success;
+            break;
+
+        case kUSB_DeviceEventResume:
+            status = kStatus_USB_Success;
+            break;
 
         case kUSB_DeviceEventSetConfiguration:
             if (*temp8 == 0U)
@@ -531,6 +603,62 @@ static usb_status_t usb_device_callback(usb_device_handle handle, uint32_t event
 }
 
 /* ========================================================================= */
+/* Suspend / remote wake-up                                                  */
+/* ========================================================================= */
+
+void usb_device_request_wakeup(void)
+{
+    s_wakeRequested = true; /* acted on by usb_device_poll() */
+}
+
+static bool remote_wake_enabled(void)
+{
+    uint8_t v = 0U;
+    if ((s_deviceHandle == NULL) ||
+        (USB_DeviceGetStatus(s_deviceHandle, kUSB_DeviceStatusRemoteWakeup, &v) != kStatus_USB_Success))
+    {
+        return false;
+    }
+    return v != 0U;
+}
+
+void usb_device_poll(uint32_t nowMs)
+{
+    USB_Type *usb = USB1;
+    bool wake     = remote_wake_enabled();
+
+    app_status_pc_remote_wake(wake);
+    if (!s_suspended)
+    {
+        s_wakeRequested = false;
+        return;
+    }
+
+    if ((usb->PORTSC1 & USB_PORTSC1_SUSP_MASK) == 0U)
+    {
+        /* The PC resumed the bus (its own wake-up, or ours below). */
+        s_suspended     = false;
+        s_wakeRequested = false;
+        hid_merge_set_suspended(false);
+        app_status_pc_suspended(false);
+        return;
+    }
+
+    /* At most one wake-up attempt per second. */
+    if (s_wakeRequested && wake && ((uint32_t)(nowMs - s_lastWakeMs) >= 1000U))
+    {
+        s_wakeRequested = false;
+        s_lastWakeMs    = nowMs;
+        /* Remote wake-up: drive resume (K state) on the bus for 1..15 ms
+         * (USB 2.0, 7.1.7.7). The host takes over and resumes the port. */
+        usb->PORTSC1 |= USB_PORTSC1_FPR_MASK;
+        vTaskDelay(pdMS_TO_TICKS(APP_RESUME_SIGNAL_MS));
+        usb->PORTSC1 &= ~USB_PORTSC1_FPR_MASK;
+        app_status_pc_wakeup();
+    }
+}
+
+/* ========================================================================= */
 /* Interrupt handler                                                         */
 /* ========================================================================= */
 
@@ -568,6 +696,8 @@ void usb_device_app_init(void)
 #endif
 
     s_currentConfiguration = 0U;
+    s_bootProtocol         = false;
+    s_suspended            = false;
     usb_device_set_speed(USB_SPEED_HIGH);
 
     /* Registers the HID class + our ch9 callback with the device stack and

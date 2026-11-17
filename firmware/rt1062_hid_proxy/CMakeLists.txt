@@ -62,6 +62,13 @@ set(APP_SOURCES
     source/usb_host.c
     source/app_status.c
     source/status_led.c
+    source/system_task.c
+    source/watch.c
+    source/watchdog.c
+    source/crc32.c
+    source/settings.c
+    source/fw_update.c
+    source/flash_ops.c
 )
 
 set(BOARD_SOURCES
@@ -84,6 +91,7 @@ set(SDK_SOURCES
     ${SDK}/drivers/dmamux/fsl_dmamux.c
     ${SDK}/drivers/pit/fsl_pit.c
     ${SDK}/drivers/cache/armv7-m7/fsl_cache.c
+    ${SDK}/drivers/wdog01/fsl_wdog.c
     ${SDK}/components/osa/fsl_os_abstraction_free_rtos.c
     ${SDK}/components/lists/fsl_component_generic_list.c
 )
@@ -102,6 +110,8 @@ set(USB_SOURCES
     ${USB}/host/usb_host_framework.c
     ${USB}/host/usb_host_ehci.c
     ${USB}/host/class/usb_host_hid.c
+    ${USB}/host/class/usb_host_hub.c
+    ${USB}/host/class/usb_host_hub_app.c
 )
 
 set(RTOS_SOURCES
@@ -135,6 +145,7 @@ target_include_directories(hid_proxy.elf SYSTEM PRIVATE
     ${SDK}/drivers/dmamux
     ${SDK}/drivers/pit
     ${SDK}/drivers/cache/armv7-m7
+    ${SDK}/drivers/wdog01
     ${SDK}/components/osa
     ${SDK}/components/lists
     ${USB}/include

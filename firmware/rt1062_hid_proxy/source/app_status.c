@@ -37,7 +37,49 @@ void app_status_pc_report_sent(void)
     s_status.pcReports++;
 }
 
-void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_t interfaceNumber)
+void app_status_pc_boot_protocol(bool boot)
+{
+    s_status.pcBootProtocol = boot;
+}
+
+void app_status_pc_suspended(bool suspended)
+{
+    s_status.pcSuspended = suspended;
+}
+
+void app_status_pc_remote_wake(bool enabled)
+{
+    s_status.pcRemoteWake = enabled;
+}
+
+void app_status_pc_wakeup(void)
+{
+    s_status.pcWakeups++;
+}
+
+void app_status_uart(uint32_t rxBytes, uint32_t overflows, uint32_t lostBytes, uint32_t hwOverruns)
+{
+    s_status.uartRxBytes    = rxBytes;
+    s_status.uartOverflows  = overflows;
+    s_status.uartLostBytes  = lostBytes;
+    s_status.uartHwOverruns = hwOverruns;
+}
+
+void app_status_settings(uint16_t smoothMs, uint32_t saves, uint32_t errors)
+{
+    s_status.settingsSmooth = smoothMs;
+    s_status.settingsSaves  = saves;
+    s_status.settingsErrors = errors;
+}
+
+void app_status_reset(const char *cause, uint32_t fatalCode, const char *stalledTask)
+{
+    s_status.resetCause       = cause;
+    s_status.resetFatalCode   = fatalCode;
+    s_status.resetStalledTask = stalledTask;
+}
+
+void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_t interfaceNumber, bool viaHub)
 {
     s_status.mouseState        = APP_MOUSE_ENUMERATING;
     s_status.mouseError        = NULL;
@@ -45,6 +87,7 @@ void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_
     s_status.mousePid          = pid;
     s_status.mouseSpeed        = speed;
     s_status.mouseInterface    = interfaceNumber;
+    s_status.mouseViaHub       = viaHub;
     s_status.mouseBootProtocol = false;
     s_status.mousePacketSize   = 0U;
     s_status.mouseReports      = 0U;
@@ -53,7 +96,7 @@ void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_
 
 void app_status_mouse_unsupported(uint16_t vid, uint16_t pid, uint8_t speed)
 {
-    app_status_mouse_attached(vid, pid, speed, 0U);
+    app_status_mouse_attached(vid, pid, speed, 0U, false);
     s_status.mouseState = APP_MOUSE_UNSUPPORTED;
 }
 
@@ -120,6 +163,10 @@ bool app_status_led_on(const app_status_t *s, uint32_t nowMs)
     if (app_status_has_fault(s, nowMs))
     {
         return (nowMs % 200U) < 100U; /* 5 Hz */
+    }
+    if (s->pcConfigured && s->pcSuspended)
+    {
+        return false; /* PC asleep */
     }
     if (s->pcConfigured)
     {
@@ -213,6 +260,11 @@ static void print_layout(write_fn w, const app_status_t *s)
         return;
     }
     uint8_t refId = l->x.reportId;
+    uint16_t arrMask = 0U;
+    for (uint32_t k = 0U; k < HID_MAX_BUTTON_ARRAYS; k++)
+    {
+        arrMask |= hid_button_array_mask(&l->arrays[k]);
+    }
     if (l->usesReportId)
     {
         put(w, " report-id=");
@@ -223,14 +275,14 @@ static void print_layout(write_fn w, const app_status_t *s)
         put(w, " boot");
     }
 
-    /* buttons=5(0x1f)@0 : count, mask, bit offset of button 1 */
-    uint8_t mask = l->buttons.mask;
+    /* buttons=5(0x001f)@0 : count, mask, bit offset of the lowest button */
+    uint16_t mask = l->buttons.mask;
     put(w, " buttons=");
-    if (mask == 0U)
+    if ((mask == 0U) && (arrMask == 0U))
     {
         put(w, "none");
     }
-    else
+    else if (mask != 0U)
     {
         uint32_t count = 0U;
         uint8_t first  = 0U;
@@ -244,18 +296,43 @@ static void print_layout(write_fn w, const app_status_t *s)
         }
         put_dec(w, count);
         put(w, "(0x");
-        put_hex(w, mask, 2U);
+        put_hex(w, mask, 4U);
         put(w, ")@");
         put_dec(w, l->buttons.bitOffset[first]);
-        if (l->usesReportId && (l->buttons.reportId != refId))
+        if (l->usesReportId && (l->buttons.reportId[first] != refId))
         {
             put(w, "#");
-            put_dec(w, l->buttons.reportId);
+            put_dec(w, l->buttons.reportId[first]);
+        }
+    }
+    /* array=1-16:6x8@8 : button range, count x bits, bit offset */
+    for (uint32_t k = 0U; k < HID_MAX_BUTTON_ARRAYS; k++)
+    {
+        const hid_button_array_t *a = &l->arrays[k];
+        if (!a->present)
+        {
+            continue;
+        }
+        put(w, (mask == 0U) && (k == 0U) ? "array=" : " array=");
+        put_dec(w, a->usageMin);
+        put(w, "-");
+        put_dec(w, a->usageMax);
+        put(w, ":");
+        put_dec(w, a->count);
+        put(w, "x");
+        put_dec(w, a->bitSize);
+        put(w, "@");
+        put_dec(w, a->bitOffset);
+        if (l->usesReportId && (a->reportId != refId))
+        {
+            put(w, "#");
+            put_dec(w, a->reportId);
         }
     }
     put_field(w, "x", &l->x, l->usesReportId, refId);
     put_field(w, "y", &l->y, l->usesReportId, refId);
     put_field(w, "wheel", &l->wheel, l->usesReportId, refId);
+    put_field(w, "pan", &l->pan, l->usesReportId, refId);
 }
 
 static void print_mouse(write_fn w, const app_status_t *s)
@@ -287,6 +364,10 @@ static void print_mouse(write_fn w, const app_status_t *s)
     }
     put(w, " interface=");
     put_dec(w, s->mouseInterface);
+    if (s->mouseViaHub)
+    {
+        put(w, " via-hub");
+    }
     if (st == APP_MOUSE_READY)
     {
         put(w, " packet=");
@@ -346,12 +427,68 @@ void app_status_print(const app_status_t *s, uint32_t nowMs, void (*write)(const
     }
     put(write, " reports=");
     put_dec(write, s->pcReports);
+    if (s->pcBootProtocol)
+    {
+        put(write, " boot-protocol");
+    }
+    if (s->pcSuspended)
+    {
+        put(write, " suspended");
+    }
+    if (s->pcRemoteWake)
+    {
+        put(write, " remote-wake");
+    }
+    if (s->pcWakeups != 0U)
+    {
+        put(write, " wakeups=");
+        put_dec(write, s->pcWakeups);
+    }
     put(write, "\r\n");
 
     print_mouse(write, s);
     put(write, "\r\n");
 
     print_layout(write, s);
+    put(write, "\r\n");
+
+    put(write, "uart: rx=");
+    put_dec(write, s->uartRxBytes);
+    put(write, " overflows=");
+    put_dec(write, s->uartOverflows);
+    put(write, " lost=");
+    put_dec(write, s->uartLostBytes);
+    if (s->uartHwOverruns != 0U)
+    {
+        put(write, " fifo-overruns=");
+        put_dec(write, s->uartHwOverruns);
+    }
+    put(write, "\r\n");
+
+    put(write, "settings: smooth=");
+    put_dec(write, s->settingsSmooth);
+    put(write, " saves=");
+    put_dec(write, s->settingsSaves);
+    if (s->settingsErrors != 0U)
+    {
+        put(write, " write-errors=");
+        put_dec(write, s->settingsErrors);
+    }
+    put(write, "\r\n");
+
+    put(write, "reset: ");
+    put(write, (s->resetCause != NULL) ? s->resetCause : "unknown");
+    if (s->resetStalledTask != NULL)
+    {
+        put(write, " (task ");
+        put(write, s->resetStalledTask);
+        put(write, " stopped responding)");
+    }
+    if (s->resetFatalCode != 0U)
+    {
+        put(write, " after-fatal=0x");
+        put_hex(write, s->resetFatalCode, 8U);
+    }
     put(write, "\r\n");
 
     print_faults(write, s, nowMs);

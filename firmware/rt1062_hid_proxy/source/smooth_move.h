@@ -42,6 +42,10 @@ void smooth_move_start(int32_t dx, int32_t dy);
  * contexts at once. */
 void smooth_move_tick(int32_t *outDx, int32_t *outDy);
 
+/* cmd.stop(): drop the move in progress and everything queued. The cursor
+ * stays where the eased motion has brought it so far. Task context. */
+void smooth_move_cancel(void);
+
 /* True while segments are queued or in progress. */
 bool smooth_move_busy(void);
 

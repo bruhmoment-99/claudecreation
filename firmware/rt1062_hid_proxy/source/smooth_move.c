@@ -162,6 +162,16 @@ void smooth_move_start(int32_t dx, int32_t dy)
     CRIT_EXIT(m);
 }
 
+void smooth_move_cancel(void)
+{
+    /* The tick runs in the PIT ISR; the lock keeps it from running while the
+     * queue and the active segment are cleared. */
+    uint32_t m = CRIT_ENTER();
+    s_s.tail   = s_s.head;
+    s_s.active = false;
+    CRIT_EXIT(m);
+}
+
 APP_HOT void smooth_move_tick(int32_t *outDx, int32_t *outDy)
 {
     int32_t sx = 0;

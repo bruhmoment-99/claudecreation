@@ -41,6 +41,10 @@ typedef struct
     volatile bool pcConfigured;
     volatile uint8_t pcSpeed;       /* APP_USB_SPEED_*                    */
     volatile uint32_t pcReports;    /* reports delivered to the PC        */
+    volatile bool pcBootProtocol;   /* BIOS/UEFI selected boot protocol   */
+    volatile bool pcSuspended;      /* PC suspended the bus (sleep)       */
+    volatile bool pcRemoteWake;     /* PC allowed remote wake-up          */
+    volatile uint32_t pcWakeups;    /* remote wake-ups signalled          */
 
     /* USB2, the physical mouse */
     volatile app_mouse_state_t mouseState;
@@ -49,10 +53,27 @@ typedef struct
     uint16_t mouseVid;
     uint16_t mousePid;
     uint8_t mouseInterface;         /* bInterfaceNumber                   */
+    bool mouseViaHub;               /* attached behind a hub              */
     bool mouseBootProtocol;         /* layout is the boot fallback        */
     uint16_t mousePacketSize;       /* interrupt IN wMaxPacketSize used   */
     hid_mouse_layout_t layout;      /* valid while READY                  */
     volatile uint32_t mouseReports; /* IN reports received from the mouse */
+
+    /* Command UART */
+    volatile uint32_t uartRxBytes;   /* bytes taken from the RX ring      */
+    volatile uint32_t uartOverflows; /* times the ring was overrun        */
+    volatile uint32_t uartLostBytes; /* bytes lost in those overruns      */
+    volatile uint32_t uartHwOverruns;/* LPUART FIFO overruns (should be 0)*/
+
+    /* Saved settings */
+    volatile uint16_t settingsSmooth; /* value in flash                   */
+    volatile uint32_t settingsSaves;
+    volatile uint32_t settingsErrors;
+
+    /* Why the board last started (reset_info.c) */
+    const char *resetCause;           /* "power-on", "watchdog", ...      */
+    uint32_t resetFatalCode;          /* app_fatal() code before it, or 0 */
+    const char *resetStalledTask;     /* task the watchdog gave up on     */
 
     /* Faults */
     volatile bool hostInitFailed;   /* USB_HostInit() failed              */
@@ -72,10 +93,14 @@ const app_status_t *app_status_get(void);
 void app_status_pc_speed(uint8_t speed);
 void app_status_pc_configured(bool configured);
 void app_status_pc_report_sent(void);
+void app_status_pc_boot_protocol(bool boot);
+void app_status_pc_suspended(bool suspended);
+void app_status_pc_remote_wake(bool enabled);
+void app_status_pc_wakeup(void);
 
 /* ---- USB2 / mouse side (usb_host.c) ------------------------------------- */
 /* A device offered a HID interface we claimed; enumeration continues. */
-void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_t interfaceNumber);
+void app_status_mouse_attached(uint16_t vid, uint16_t pid, uint8_t speed, uint8_t interfaceNumber, bool viaHub);
 /* A device without a usable HID interface was plugged in. The state stays
  * UNSUPPORTED until the next device is attached (the SDK does not report
  * the detach of a device nobody claimed). */
@@ -90,6 +115,14 @@ void app_status_mouse_report(void);
 void app_status_host_init_failed(void);
 void app_status_vbus_fault(uint32_t nowMs);
 
+/* ---- Command UART (uart_parser.c) ---------------------------------------- */
+void app_status_uart(uint32_t rxBytes, uint32_t overflows, uint32_t lostBytes, uint32_t hwOverruns);
+
+/* ---- Settings and reset cause (system task, reset_info.c) ---------------- */
+void app_status_settings(uint16_t smoothMs, uint32_t saves, uint32_t errors);
+/* cause: static string; fatalCode 0 = none; stalledTask NULL = none. */
+void app_status_reset(const char *cause, uint32_t fatalCode, const char *stalledTask);
+
 /* ---- Readers ------------------------------------------------------------ */
 
 /* True if anything in the status counts as a fault for the LED. */
@@ -98,6 +131,7 @@ bool app_status_has_fault(const app_status_t *s, uint32_t nowMs);
 /*
  * LED pattern (period 2 s, evaluated every few tens of ms):
  *   fault (see app_status_has_fault)       fast blink, 5 Hz
+ *   PC suspended the bus (PC asleep)       off
  *   PC configured, mouse ready             solid on
  *   PC configured, no mouse                slow blink, 1 Hz
  *   PC not configured, mouse ready         two short blips every 2 s

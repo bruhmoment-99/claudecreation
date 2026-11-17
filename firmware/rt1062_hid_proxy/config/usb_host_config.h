@@ -197,7 +197,7 @@
  *        - if 0, host HUB class driver is disable.
  *        - if greater than 0, host HUB class driver is enable.
  */
-#define USB_HOST_CONFIG_HUB (0U)
+#define USB_HOST_CONFIG_HUB (1U)
 
 /*!
  * @brief host HID class instance count, meantime it indicates HID class enable or disable.

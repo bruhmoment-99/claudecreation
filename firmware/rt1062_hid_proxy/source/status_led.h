@@ -1,12 +1,15 @@
 /*
- * status_led.h - Status LED task and the fatal-error handler.
+ * status_led.h - The fatal-error handler and the millisecond clock.
  *
  * The LED shows the state from app_status.h (see app_status_led_on() for
- * the patterns). app_fatal() is the single place every unrecoverable error
- * ends up: FreeRTOS asserts, stack overflow, heap exhaustion, HardFault and
- * failed bring-up steps. It stops everything and flickers the LED at 20 Hz,
- * so a crash is visible without a debugger. The code is kept in
- * g_appFatalCode for inspection with a probe.
+ * the patterns; system_task.c refreshes it). app_fatal() is the single
+ * place every unrecoverable error ends up: FreeRTOS asserts, stack
+ * overflow, heap exhaustion, HardFault and failed bring-up steps. It stops
+ * everything and flickers the LED at 20 Hz, so a crash is visible without a
+ * debugger. The code is kept in g_appFatalCode for inspection with a probe,
+ * and in a note that survives the reset: once the watchdog runs, it resets
+ * the board after APP_WDOG_TIMEOUT_MS and cmd.status() then shows the code
+ * on its "reset:" line.
  */
 #ifndef STATUS_LED_H_
 #define STATUS_LED_H_
@@ -26,9 +29,6 @@
 extern volatile uint32_t g_appFatalCode;
 extern const char *volatile g_appFatalFile; /* set by a failed assert() */
 extern volatile int g_appFatalLine;
-
-/* Low-priority task that refreshes the LED every APP_LED_REFRESH_MS. */
-void status_led_task(void *arg);
 
 /* Milliseconds since the scheduler started (wraps after ~49 days). */
 uint32_t app_now_ms(void);

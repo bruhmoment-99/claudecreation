@@ -1,11 +1,12 @@
 /*
- * status_led.c - Drives the status LED from app_status, and handles fatal
- * errors (see status_led.h).
+ * status_led.c - Fatal error handling and the millisecond clock (see
+ * status_led.h). The LED itself is refreshed by system_task.c.
  */
 #include "status_led.h"
 #include "app_config.h"
 #include "app_status.h"
 #include "board_init.h"
+#include "watchdog.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -20,22 +21,14 @@ uint32_t app_now_ms(void)
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-void status_led_task(void *arg)
-{
-    (void)arg;
-    TickType_t last = xTaskGetTickCount();
-
-    for (;;)
-    {
-        board_led_set(app_status_led_on(app_status_get(), app_now_ms()));
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(APP_LED_REFRESH_MS));
-    }
-}
-
 void app_fatal(uint32_t code)
 {
     __disable_irq();
     g_appFatalCode = code;
+    watchdog_note_fatal(code);
+    /* Nothing feeds the watchdog any more: if it runs, the board resets
+     * after APP_WDOG_TIMEOUT_MS; if not (early bring-up), this flickers
+     * forever. */
 
     /* The scheduler and SysTick are gone; time the flicker with a busy loop.
      * It is approximate, which is fine for a blink. */

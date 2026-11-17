@@ -46,6 +46,7 @@
 #define USAGE_GD_X          0x00010030UL
 #define USAGE_GD_Y          0x00010031UL
 #define USAGE_GD_WHEEL      0x00010038UL
+#define USAGE_CONSUMER_PAN  0x000C0238UL
 #define PAGE_BUTTON         0x0009U
 
 #define COLLECTION_APPLICATION 0x01U
@@ -57,6 +58,7 @@ typedef struct
 {
     uint32_t usagePage;
     int32_t logicalMin;
+    int32_t logicalMax;
     uint32_t reportSize;
     uint32_t reportCount;
     uint8_t reportId;
@@ -111,51 +113,87 @@ static void set_field(hid_field_t *f, const hid_globals_t *g, uint16_t bitOffset
     f->isSigned  = (g->logicalMin < 0) || relative;
 }
 
+static void map_variable(hid_mouse_layout_t *out, const hid_globals_t *g, const hid_locals_t *l, uint16_t base,
+                         bool relative)
+{
+    for (uint32_t i = 0U; i < g->reportCount; i++)
+    {
+        uint32_t usage = usage_for_index(l, i);
+        uint16_t off   = (uint16_t)(base + i * g->reportSize);
+        uint16_t page  = (uint16_t)(usage >> 16);
+        uint16_t id    = (uint16_t)(usage & 0xFFFFU);
+
+        if ((page == PAGE_BUTTON) && (id >= 1U) && (id <= HID_MAX_MAPPED_BUTTONS) && (g->reportSize == 1U))
+        {
+            uint16_t bit = (uint16_t)(1U << (id - 1U));
+            if ((out->buttons.mask & bit) == 0U) /* first occurrence wins */
+            {
+                out->buttons.mask |= bit;
+                out->buttons.reportId[id - 1U]  = g->reportId;
+                out->buttons.bitOffset[id - 1U] = off;
+            }
+        }
+        else if (usage == USAGE_GD_X)
+        {
+            set_field(&out->x, g, off, relative);
+        }
+        else if (usage == USAGE_GD_Y)
+        {
+            set_field(&out->y, g, off, relative);
+        }
+        else if (usage == USAGE_GD_WHEEL)
+        {
+            set_field(&out->wheel, g, off, relative);
+        }
+        else if (usage == USAGE_CONSUMER_PAN)
+        {
+            set_field(&out->pan, g, off, relative);
+        }
+    }
+}
+
+/* Input Array on the Button page: "which buttons are down" as a list. */
+static void map_array(hid_mouse_layout_t *out, const hid_globals_t *g, const hid_locals_t *l, uint16_t base)
+{
+    if (!l->haveMin || !l->haveMax || ((l->usageMin >> 16) != PAGE_BUTTON) || (g->reportSize == 0U) ||
+        (g->reportSize > 16U) || (g->reportCount == 0U) || (g->logicalMax < g->logicalMin))
+    {
+        return;
+    }
+    for (uint32_t k = 0U; k < HID_MAX_BUTTON_ARRAYS; k++)
+    {
+        hid_button_array_t *a = &out->arrays[k];
+        if (!a->present)
+        {
+            a->present    = true;
+            a->reportId   = g->reportId;
+            a->bitSize    = (uint8_t)g->reportSize;
+            a->count      = (uint8_t)((g->reportCount > 255U) ? 255U : g->reportCount);
+            a->bitOffset  = base;
+            a->usageMin   = (uint16_t)(l->usageMin & 0xFFFFU);
+            a->usageMax   = (uint16_t)(l->usageMax & 0xFFFFU);
+            a->logicalMin = g->logicalMin;
+            a->logicalMax = g->logicalMax;
+            return;
+        }
+    }
+}
+
 static void handle_input(hid_mouse_layout_t *out, const hid_globals_t *g, const hid_locals_t *l,
                          uint32_t flags, bool inMouse)
 {
     uint16_t base  = s_bitPos[g->reportId];
     uint32_t total = g->reportSize * g->reportCount;
 
-    if (inMouse && ((flags & INPUT_CONSTANT) == 0U) && ((flags & INPUT_VARIABLE) != 0U) &&
-        (g->reportSize > 0U))
+    if (inMouse && ((flags & INPUT_CONSTANT) == 0U) && (g->reportSize > 0U))
     {
-        bool relative = (flags & INPUT_RELATIVE) != 0U;
-
-        for (uint32_t i = 0U; i < g->reportCount; i++)
+        if ((flags & INPUT_VARIABLE) != 0U)
         {
-            uint32_t usage = usage_for_index(l, i);
-            uint16_t off   = (uint16_t)(base + i * g->reportSize);
-            uint16_t page  = (uint16_t)(usage >> 16);
-            uint16_t id    = (uint16_t)(usage & 0xFFFFU);
-
-            if ((page == PAGE_BUTTON) && (id >= 1U) && (id <= HID_MAX_MAPPED_BUTTONS) && (g->reportSize == 1U))
-            {
-                uint8_t bit = (uint8_t)(1U << (id - 1U));
-                if (out->buttons.mask == 0U)
-                {
-                    out->buttons.reportId = g->reportId;
-                }
-                if ((out->buttons.reportId == g->reportId) && ((out->buttons.mask & bit) == 0U))
-                {
-                    out->buttons.mask |= bit;
-                    out->buttons.bitOffset[id - 1U] = off;
-                }
-            }
-            else if (usage == USAGE_GD_X)
-            {
-                set_field(&out->x, g, off, relative);
-            }
-            else if (usage == USAGE_GD_Y)
-            {
-                set_field(&out->y, g, off, relative);
-            }
-            else if (usage == USAGE_GD_WHEEL)
-            {
-                set_field(&out->wheel, g, off, relative);
-            }
-            /* Extend here: Consumer AC Pan (0x000C0238) for horizontal scroll,
-             * array-style button fields, etc. */
+            map_variable(out, g, l, base, (flags & INPUT_RELATIVE) != 0U);
+        }
+        else
+        {
+            map_array(out, g, l, base);
         }
     }
     /* Constant padding and non-mouse fields still occupy bits. */
@@ -273,7 +311,10 @@ bool hid_parse_mouse_layout(const uint8_t *desc, uint32_t len, hid_mouse_layout_
                         g.logicalMin = s;
                         break;
                     case GLOBAL_LOGICAL_MAX:
-                        break; /* not needed for decoding */
+                        /* Sign-extend only when Logical Minimum is negative
+                         * (HID 1.11, 6.2.2.7). */
+                        g.logicalMax = (g.logicalMin < 0) ? s : (int32_t)u;
+                        break;
                     case GLOBAL_REPORT_SIZE:
                         g.reportSize = u;
                         break;
@@ -339,6 +380,7 @@ void hid_mouse_layout_boot(hid_mouse_layout_t *out)
     out->buttons.mask = 0x07U;
     for (uint8_t b = 0U; b < 3U; b++)
     {
+        out->buttons.reportId[b]  = 0U;
         out->buttons.bitOffset[b] = b;
     }
     out->x = (hid_field_t){.present = true, .isSigned = true, .reportId = 0U, .bitSize = 8U, .bitOffset = 8U};
@@ -374,6 +416,23 @@ static APP_HOT int32_t get_field(const hid_field_t *f, const uint8_t *buf, uint3
     return (int32_t)v;
 }
 
+uint16_t hid_button_array_mask(const hid_button_array_t *a)
+{
+    uint16_t mask = 0U;
+    if (!a->present)
+    {
+        return 0U;
+    }
+    for (uint32_t u = a->usageMin; (u <= a->usageMax) && (u <= HID_MAX_MAPPED_BUTTONS); u++)
+    {
+        if (u >= 1U)
+        {
+            mask |= (uint16_t)(1U << (u - 1U));
+        }
+    }
+    return mask;
+}
+
 APP_HOT bool hid_extract_mouse(const hid_mouse_layout_t *l, const uint8_t *report, uint32_t len,
                                hid_mouse_sample_t *out)
 {
@@ -381,9 +440,9 @@ APP_HOT bool hid_extract_mouse(const hid_mouse_layout_t *l, const uint8_t *repor
     const uint8_t *p = report;
     bool any         = false;
 
-    out->buttonsValid = false;
-    out->buttons      = 0U;
-    out->x = out->y = out->wheel = 0;
+    out->buttonsMask = 0U;
+    out->buttons     = 0U;
+    out->x = out->y = out->wheel = out->pan = 0;
 
     if (!l->valid || (len == 0U))
     {
@@ -396,17 +455,46 @@ APP_HOT bool hid_extract_mouse(const hid_mouse_layout_t *l, const uint8_t *repor
         len--;
     }
 
-    if ((l->buttons.mask != 0U) && (l->buttons.reportId == rid))
+    for (uint8_t b = 0U; b < HID_MAX_MAPPED_BUTTONS; b++)
     {
-        for (uint8_t b = 0U; b < HID_MAX_MAPPED_BUTTONS; b++)
+        uint16_t bit = (uint16_t)(1U << b);
+        if (((l->buttons.mask & bit) != 0U) && (l->buttons.reportId[b] == rid))
         {
-            if ((l->buttons.mask & (1U << b)) && get_bits(p, len, l->buttons.bitOffset[b], 1U))
+            out->buttonsMask |= bit;
+            if (get_bits(p, len, l->buttons.bitOffset[b], 1U) != 0U)
             {
-                out->buttons |= (uint8_t)(1U << b);
+                out->buttons |= bit;
+            }
+            any = true;
+        }
+    }
+    for (uint8_t k = 0U; k < HID_MAX_BUTTON_ARRAYS; k++)
+    {
+        const hid_button_array_t *a = &l->arrays[k];
+        if (!a->present || (a->reportId != rid))
+        {
+            continue;
+        }
+        out->buttonsMask |= hid_button_array_mask(a);
+        any = true;
+        for (uint32_t i = 0U; i < a->count; i++)
+        {
+            uint32_t raw = get_bits(p, len, a->bitOffset + i * a->bitSize, a->bitSize);
+            int32_t v    = (int32_t)raw;
+            if ((a->logicalMin < 0) && ((raw & (1UL << (a->bitSize - 1U))) != 0U))
+            {
+                v -= (int32_t)(1UL << a->bitSize); /* sign-extend (bitSize <= 16) */
+            }
+            if ((v < a->logicalMin) || (v > a->logicalMax))
+            {
+                continue; /* "no button" */
+            }
+            int32_t usage = (int32_t)a->usageMin + (v - a->logicalMin);
+            if ((usage >= 1) && (usage <= (int32_t)HID_MAX_MAPPED_BUTTONS) && (usage <= (int32_t)a->usageMax))
+            {
+                out->buttons |= (uint16_t)(1U << (uint32_t)(usage - 1));
             }
         }
-        out->buttonsValid = true;
-        any               = true;
     }
     if (l->x.present && (l->x.reportId == rid))
     {
@@ -422,6 +510,11 @@ APP_HOT bool hid_extract_mouse(const hid_mouse_layout_t *l, const uint8_t *repor
     {
         out->wheel = get_field(&l->wheel, p, len);
         any        = true;
+    }
+    if (l->pan.present && (l->pan.reportId == rid))
+    {
+        out->pan = get_field(&l->pan, p, len);
+        any      = true;
     }
     return any;
 }

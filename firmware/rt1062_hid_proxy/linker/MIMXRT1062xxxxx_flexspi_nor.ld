@@ -35,7 +35,10 @@ ENTRY(Reset_Handler)
 HEAP_SIZE  = DEFINED(__heap_size__)  ? __heap_size__  : 0x0400;
 STACK_SIZE = DEFINED(__stack_size__) ? __stack_size__ : 0x0400;
 VECTOR_RAM_SIZE = DEFINED(__ram_vector_table__) ? 0x00000400 : 0;
-TEXT_SIZE = DEFINED(__use_flash16MB__) ? 0x00FFDC00 : 0x007FDC00;
+/* HID proxy: the running image is limited to its 1 MB slot (APP_SLOT_SIZE in
+ * source/app_config.h); the rest of the flash holds the update staging area
+ * and the saved settings. */
+TEXT_SIZE = 0x00100000 - 0x2400;
 
 /* Specify the memory areas */
 MEMORY
@@ -246,6 +249,16 @@ SECTIONS
     . = ALIGN(4);
     __bss_end__ = .;
     __END_BSS = .;
+  } > m_data
+
+  /* HID proxy: not zeroed or loaded by the startup code, so its content
+   * survives a watchdog or software reset (watchdog.c reset note). */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
   } > m_data
 
   .heap :

@@ -5,6 +5,8 @@
  * Controller : USB_OTG2 -> kUSB_ControllerEhci1, IRQ USB_OTG2_IRQn
  * Speed      : HS, FS and LS devices (the RT1062 EHCI has an embedded TT, so
  *              FS/LS mice work without a companion controller)
+ * Topology   : a mouse on the port, or behind a hub (USB_HOST_CONFIG_HUB);
+ *              one mouse at a time, the first one that works wins
  *
  * Task / context map
  * ------------------
@@ -13,25 +15,32 @@
  *   usb_host_stack_task  (prio 5)  thread   -> USB_HostEhciTaskFunction(): runs
  *                                              ALL host callbacks, including
  *                                              mouse_in_callback() = REAL-TIME
- *                                              MERGE PATH
+ *                                              MERGE PATH, and the hub driver
  *   usb_host_app_task    (prio 4)  thread   -> VBUS sequencing, enumeration
  *                                              control requests, detach cleanup
  *
- * Enumeration sequence (after the stack has done GET_DESCRIPTOR/SET_ADDRESS/
+ * Choosing the interface
+ * ----------------------
+ * Wireless dongles and gaming mice often have several HID interfaces
+ * (keyboard, mouse, vendor/macro). At attach every HID interface becomes a
+ * candidate, in this order: boot-protocol mouse, then HID interfaces with
+ * protocol 0, then the rest (some receivers put the mouse collection in the
+ * "keyboard" interface). Each candidate's report descriptor is fetched and
+ * parsed; the first one that contains a Mouse/Pointer collection is used.
+ * A boot-protocol mouse whose descriptor cannot be parsed falls back to the
+ * boot report format. Only if no candidate works is an error reported.
+ *
+ * Per candidate (after the stack has done GET_DESCRIPTOR/SET_ADDRESS/
  * SET_CONFIGURATION and reported kUSB_HostEventEnumerationDone):
  *   USB_HostHidInit -> SET_INTERFACE -> GET_DESCRIPTOR(Report) -> parse ->
- *   SET_IDLE(0) -> SET_PROTOCOL(Report) -> USB_HostHidRecv() loop
+ *   SET_IDLE(0) -> SET_PROTOCOL(Report) -> two USB_HostHidRecv() queued
  *
- * Required usb_host_config.h settings (copy the SDK template and set):
+ * Required usb_host_config.h settings (config/usb_host_config.h):
  *   USB_HOST_CONFIG_EHCI                          1U
  *   USB_HOST_CONFIG_HID                           1U
- *   USB_HOST_CONFIG_MAX_HOST                      1U
- *   USB_HOST_CONFIG_MAX_PIPES                     16U
+ *   USB_HOST_CONFIG_HUB                           1U  (0 = direct only)
  *   USB_HOST_CONFIG_MAX_TRANSFERS                 16U
- *   USB_HOST_CONFIG_INTERFACE_MAX_EP              4U
  *   USB_HOST_CONFIG_CONFIGURATION_MAX_INTERFACE   5U
- *   USB_HOST_CONFIG_EHCI_FRAME_LIST_SIZE          1024U
- *   USB_HOST_CONFIG_EHCI_MAX_QH / _QTD            8U / 8U
  */
 #include "usb_host_app.h"
 #include "app_config.h"
@@ -40,6 +49,7 @@
 #include "hid_merge.h"
 #include "hid_report_parser.h"
 #include "status_led.h"
+#include "watch.h"
 
 #include <string.h>
 
@@ -52,6 +62,10 @@
 #include "usb_host.h"
 #include "usb_host_hid.h"
 #include "usb_phy.h"
+#if (defined(USB_HOST_CONFIG_HUB) && (USB_HOST_CONFIG_HUB > 0U))
+#include "usb_host_hub.h" /* must precede usb_host_hub_app.h */
+#include "usb_host_hub_app.h"
+#endif
 
 #define CONTROLLER_ID   kUSB_ControllerEhci1
 #define USB_HOST_IRQn   USB_OTG2_IRQn
@@ -64,6 +78,8 @@
 
 #define HID_DESCRIPTOR_TYPE        0x21U
 #define HID_REPORT_DESCRIPTOR_TYPE 0x22U
+#define MAX_CANDIDATES             USB_HOST_CONFIG_CONFIGURATION_MAX_INTERFACE
+#define RX_BUFFERS                 2U /* IN transfers kept queued */
 
 typedef enum
 {
@@ -92,6 +108,7 @@ typedef enum
     kRun_WaitSetProtocol,
     kRun_SetProtocolDone,
     kRun_Streaming,
+    kRun_NextCandidate, /* this interface is no mouse: try the next one */
     kRun_Error,
 } run_state_t;
 
@@ -99,25 +116,27 @@ typedef struct
 {
     usb_device_handle deviceHandle;
     usb_host_class_handle classHandle;
-    usb_host_interface_handle interfaceHandle;
     usb_host_configuration_handle configHandle;
+    usb_host_interface_t *candidates[MAX_CANDIDATES];
+    uint8_t candidateCount;
+    uint8_t candidate;          /* index being tried                       */
     volatile dev_state_t devState;
     volatile run_state_t runState;
-    bool bootCapable;           /* interface subclass == boot             */
-    bool usingBoot;             /* layout = boot fallback, use BOOT proto */
+    bool bootCapable;           /* current interface: boot subclass, mouse */
+    bool usingBoot;             /* layout = boot fallback, use BOOT proto  */
     uint16_t reportDescLen;
     uint16_t inPacketSize;
-    uint8_t rxIndex;            /* double buffer index                    */
     hid_mouse_layout_t layout;
 } host_mouse_t;
 
 static usb_host_handle s_hostHandle;
 static host_mouse_t s_mouse;
 static TaskHandle_t s_appTask;
+static const char *s_lastError; /* why the last candidate was rejected */
 
 /* Buffers the EHCI controller DMAs into -> non-cacheable. */
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_reportDesc[APP_HOST_REPORT_DESC_MAX];
-USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_rxBuf[2][APP_HOST_REPORT_BUF_SIZE];
+USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_rxBuf[RX_BUFFERS][APP_HOST_REPORT_BUF_SIZE];
 
 static inline void notify_app(void)
 {
@@ -129,49 +148,50 @@ static inline void notify_app(void)
     }
 }
 
+static usb_host_interface_t *current_interface(void)
+{
+    return s_mouse.candidates[s_mouse.candidate];
+}
+
 /* ========================================================================= */
 /* REAL-TIME PATH: interrupt-IN completion                                   */
 /* ========================================================================= */
 
+/*
+ * Two IN transfers are always queued on the interrupt pipe (two buffers).
+ * When one completes, the other is already waiting in the controller, so a
+ * 125 us (8 kHz) mouse is polled again on the next microframe even while
+ * this report is being processed. The completed buffer is re-queued only
+ * AFTER it has been decoded, so the controller never writes into a buffer
+ * that is being read.
+ *
+ * Note: the SDK's USB_HostHidInPipeCallback() frees the completed transfer
+ * only after this callback returns, so the transfer pool
+ * (USB_HOST_CONFIG_MAX_TRANSFERS) must hold one more free entry than the
+ * number of queued receives, plus those used by control requests.
+ */
 static APP_HOT void mouse_in_callback(void *param, uint8_t *data, uint32_t dataLength, usb_status_t status)
 {
     host_mouse_t *m = (host_mouse_t *)param;
 
-    if ((status == kStatus_USB_TransferCancel) || (m->devState != kDev_Running))
+    if ((status == kStatus_USB_TransferCancel) || (m->devState != kDev_Running) ||
+        (m->runState != kRun_Streaming))
     {
-        return; /* detach in progress - do not re-arm */
+        return; /* detach or interface change in progress - do not re-arm */
     }
 
-    /*
-     * 1) Re-arm FIRST, into the other buffer, so the next poll of the mouse is
-     *    already queued while we process this report (minimises the gap at
-     *    8 kHz HS mice: the next interval is only 125 us away).
-     *    Note: the SDK's USB_HostHidInPipeCallback() frees the completed
-     *    transfer only AFTER this callback returns, so the transfer pool
-     *    (USB_HOST_CONFIG_MAX_TRANSFERS) must hold at least 2 free entries
-     *    beyond those used for control requests.
-     */
-    uint8_t next = (uint8_t)(m->rxIndex ^ 1U);
-    m->rxIndex   = next;
-    (void)USB_HostHidRecv(m->classHandle, s_rxBuf[next], m->inPacketSize, mouse_in_callback, m);
-
-    if ((status != kStatus_USB_Success) || (dataLength == 0U))
+    if ((status == kStatus_USB_Success) && (dataLength != 0U))
     {
-        return;
+        hid_mouse_sample_t smp;
+        app_status_mouse_report();
+        if (hid_extract_mouse(&m->layout, data, dataLength, &smp))
+        {
+            hid_merge_physical(smp.buttons, smp.buttonsMask, smp.x, smp.y, smp.wheel, smp.pan);
+        }
     }
-    app_status_mouse_report();
 
-    /*
-     * 2) Decode using the layout derived from the report descriptor, then
-     * 3) merge with injection state and send to the PC (hid_merge does steps
-     *    1-4 of the data-flow spec: add pending dx/dy/wheel, OR the buttons,
-     *    USB_DeviceHidSend on USB1, clear delivered motion).
-     */
-    hid_mouse_sample_t smp;
-    if (hid_extract_mouse(&m->layout, data, dataLength, &smp))
-    {
-        hid_merge_physical(smp.buttons, smp.buttonsValid, smp.x, smp.y, smp.wheel);
-    }
+    /* Re-queue the same buffer; the other one is already in the controller. */
+    (void)USB_HostHidRecv(m->classHandle, data, m->inPacketSize, mouse_in_callback, m);
 }
 
 /* ========================================================================= */
@@ -186,18 +206,26 @@ static void control_callback(void *param, uint8_t *data, uint32_t dataLength, us
     switch (m->runState)
     {
         case kRun_WaitSetInterface:
-            m->runState = (status == kStatus_USB_Success) ? kRun_SetInterfaceDone : kRun_Error;
-            if (m->runState == kRun_Error)
+            if (status == kStatus_USB_Success)
             {
-                app_status_mouse_error("SET_INTERFACE failed");
+                m->runState = kRun_SetInterfaceDone;
+            }
+            else
+            {
+                s_lastError = "SET_INTERFACE failed";
+                m->runState = kRun_NextCandidate;
             }
             break;
         case kRun_WaitReportDesc:
             m->reportDescLen = (uint16_t)dataLength;
-            m->runState      = (status == kStatus_USB_Success) ? kRun_ReportDescDone : kRun_Error;
-            if (m->runState == kRun_Error)
+            if (status == kStatus_USB_Success)
             {
-                app_status_mouse_error("report descriptor request failed");
+                m->runState = kRun_ReportDescDone;
+            }
+            else
+            {
+                s_lastError = "report descriptor request failed";
+                m->runState = kRun_NextCandidate;
             }
             break;
         case kRun_WaitSetIdle:
@@ -219,19 +247,37 @@ static void control_callback(void *param, uint8_t *data, uint32_t dataLength, us
 /* Host stack event callback (stack task context)                            */
 /* ========================================================================= */
 
-/* VID, PID or speed of an attached device; 0 if unavailable. */
+/* VID, PID, speed or hub number of an attached device; 0 if unavailable. */
 static uint16_t device_info(usb_device_handle deviceHandle, uint32_t what)
 {
     uint32_t v = 0U;
-    if ((deviceHandle == NULL) || (USB_HostHelperGetPeripheralInformation(deviceHandle, what, &v) != kStatus_USB_Success))
+    if ((deviceHandle == NULL) ||
+        (USB_HostHelperGetPeripheralInformation(deviceHandle, what, &v) != kStatus_USB_Success))
     {
         return 0U;
     }
     return (uint16_t)v;
 }
 
-static usb_status_t usb_host_event(usb_device_handle deviceHandle, usb_host_configuration_handle configurationHandle,
-                                   uint32_t eventCode)
+/* Rank of an interface as a mouse candidate; 0 = not HID. */
+static uint8_t candidate_rank(const usb_host_interface_t *itf)
+{
+    uint8_t cls   = itf->interfaceDesc->bInterfaceClass;
+    uint8_t proto = itf->interfaceDesc->bInterfaceProtocol;
+
+    if (cls != USB_HOST_HID_CLASS_CODE)
+    {
+        return 0U;
+    }
+    if (proto == USB_HOST_HID_PROTOCOL_MOUSE)
+    {
+        return 3U;
+    }
+    return (proto == 0U) ? 2U : 1U; /* vendor/report-only, then keyboard */
+}
+
+static usb_status_t mouse_event(usb_device_handle deviceHandle, usb_host_configuration_handle configurationHandle,
+                                uint32_t eventCode)
 {
     usb_status_t status = kStatus_USB_Success;
 
@@ -239,61 +285,52 @@ static usb_status_t usb_host_event(usb_device_handle deviceHandle, usb_host_conf
     {
         case kUSB_HostEventAttach:
         {
-            /* Offered one configuration: claim a HID mouse interface.
-             * Preference: protocol == mouse; otherwise the first HID interface
-             * with protocol 0 (many gaming mice) - its report descriptor is
-             * verified to contain a mouse collection later. */
+            /* Offered one configuration: collect its HID interfaces, best
+             * candidates first. */
             usb_host_configuration_t *cfg = (usb_host_configuration_t *)configurationHandle;
-            usb_host_interface_t *pick    = NULL;
-            bool boot                     = false;
+            uint8_t n                     = 0U;
 
             if (s_mouse.devState != kDev_Idle)
             {
                 return kStatus_USB_NotSupported; /* one mouse at a time */
             }
-            for (uint8_t i = 0U; i < cfg->interfaceCount; i++)
+            for (uint8_t rank = 3U; rank > 0U; rank--)
             {
-                usb_host_interface_t *itf = &cfg->interfaceList[i];
-                uint8_t cls               = itf->interfaceDesc->bInterfaceClass;
-                uint8_t sub               = itf->interfaceDesc->bInterfaceSubClass;
-                uint8_t proto             = itf->interfaceDesc->bInterfaceProtocol;
-
-                if (cls != USB_HOST_HID_CLASS_CODE)
+                for (uint8_t i = 0U; (i < cfg->interfaceCount) && (n < MAX_CANDIDATES); i++)
                 {
-                    continue;
-                }
-                if (proto == USB_HOST_HID_PROTOCOL_MOUSE)
-                {
-                    pick = itf;
-                    boot = (sub == USB_HOST_HID_SUBCLASS_CODE_BOOT);
-                    break;
-                }
-                if ((pick == NULL) && (sub == USB_HOST_HID_SUBCLASS_CODE_NONE) && (proto == 0U))
-                {
-                    pick = itf;
+                    if (candidate_rank(&cfg->interfaceList[i]) == rank)
+                    {
+                        s_mouse.candidates[n++] = &cfg->interfaceList[i];
+                    }
                 }
             }
-            if (pick == NULL)
+            if (n == 0U)
             {
                 status = kStatus_USB_NotSupported;
                 break;
             }
-            s_mouse.deviceHandle    = deviceHandle;
-            s_mouse.configHandle    = configurationHandle;
-            s_mouse.interfaceHandle = pick;
-            s_mouse.bootCapable     = boot;
-            app_status_mouse_attached(device_info(deviceHandle, kUSB_HostGetDeviceVID),
-                                      device_info(deviceHandle, kUSB_HostGetDevicePID),
-                                      (uint8_t)device_info(deviceHandle, kUSB_HostGetDeviceSpeed),
-                                      pick->interfaceDesc->bInterfaceNumber);
+            s_mouse.deviceHandle   = deviceHandle;
+            s_mouse.configHandle   = configurationHandle;
+            s_mouse.candidateCount = n;
+            s_mouse.candidate      = 0U;
             break;
         }
 
         case kUSB_HostEventEnumerationDone:
-            if ((s_mouse.devState == kDev_Idle) && (s_mouse.configHandle == configurationHandle))
+            if ((s_mouse.devState == kDev_Idle) && (s_mouse.configHandle == configurationHandle) &&
+                (s_mouse.candidateCount > 0U))
             {
+                app_status_mouse_attached(device_info(deviceHandle, kUSB_HostGetDeviceVID),
+                                          device_info(deviceHandle, kUSB_HostGetDevicePID),
+                                          (uint8_t)device_info(deviceHandle, kUSB_HostGetDeviceSpeed),
+                                          s_mouse.candidates[0]->interfaceDesc->bInterfaceNumber,
+                                          device_info(deviceHandle, kUSB_HostGetDeviceHubNumber) != 0U);
                 s_mouse.devState = kDev_Attached;
                 notify_app();
+            }
+            else
+            {
+                status = kStatus_USB_NotSupported;
             }
             break;
 
@@ -303,10 +340,14 @@ static usb_status_t usb_host_event(usb_device_handle deviceHandle, usb_host_conf
                 s_mouse.devState = kDev_Detached;
                 notify_app();
             }
+            else
+            {
+                status = kStatus_USB_NotSupported;
+            }
             break;
 
         case kUSB_HostEventNotSupported:
-            /* No configuration offered a HID interface we can use. */
+            /* No configuration offered a HID interface (and no hub). */
             if (s_mouse.devState == kDev_Idle)
             {
                 app_status_mouse_unsupported(device_info(deviceHandle, kUSB_HostGetDeviceVID),
@@ -328,6 +369,32 @@ static usb_status_t usb_host_event(usb_device_handle deviceHandle, usb_host_conf
             break;
     }
     return status;
+}
+
+/*
+ * The stack has one callback; with hub support it is shared between the hub
+ * driver and the mouse. A device/configuration is supported if either of
+ * them takes it.
+ */
+static usb_status_t usb_host_event(usb_device_handle deviceHandle, usb_host_configuration_handle configurationHandle,
+                                   uint32_t eventCode)
+{
+    usb_status_t mouse = mouse_event(deviceHandle, configurationHandle, eventCode);
+#if (defined(USB_HOST_CONFIG_HUB) && (USB_HOST_CONFIG_HUB > 0U))
+    usb_status_t hub = USB_HostHubDeviceEvent(s_hostHandle, deviceHandle, configurationHandle, eventCode);
+    switch (eventCode & 0x0000FFFFU)
+    {
+        case kUSB_HostEventAttach:
+        case kUSB_HostEventEnumerationDone:
+        case kUSB_HostEventDetach:
+            return ((mouse == kStatus_USB_Success) || (hub == kStatus_USB_Success)) ? kStatus_USB_Success
+                                                                                      : kStatus_USB_NotSupported;
+        default:
+            return kStatus_USB_Success;
+    }
+#else
+    return mouse;
+#endif
 }
 
 /* ========================================================================= */
@@ -372,12 +439,18 @@ static uint16_t find_report_desc_len(usb_host_interface_t *itf)
     return 0U;
 }
 
-static void mouse_teardown(void)
+static void release_class(void)
 {
     if (s_mouse.classHandle != NULL)
     {
         (void)USB_HostHidDeinit(s_mouse.deviceHandle, s_mouse.classHandle);
+        s_mouse.classHandle = NULL;
     }
+}
+
+static void mouse_teardown(void)
+{
+    release_class();
     memset(&s_mouse, 0, sizeof(s_mouse));
     s_mouse.devState = kDev_Idle;
     hid_merge_physical_disconnected(); /* release physical-only buttons */
@@ -392,6 +465,51 @@ static void mouse_fail(const char *reason)
     app_status_mouse_error(reason);
 }
 
+/* Bind the HID class to the current candidate and select alternate 0. */
+static void start_candidate(void)
+{
+    host_mouse_t *m          = &s_mouse;
+    usb_host_interface_t *it = current_interface();
+
+    m->bootCapable = (it->interfaceDesc->bInterfaceSubClass == USB_HOST_HID_SUBCLASS_CODE_BOOT) &&
+                     (it->interfaceDesc->bInterfaceProtocol == USB_HOST_HID_PROTOCOL_MOUSE);
+    m->usingBoot   = false;
+
+    if (USB_HostHidInit(m->deviceHandle, &m->classHandle) != kStatus_USB_Success)
+    {
+        mouse_fail("HID class init failed");
+        return;
+    }
+    /* SET_INTERFACE(alt 0) completes synchronously inside this call. */
+    m->runState = kRun_WaitSetInterface;
+    if (USB_HostHidSetInterface(m->classHandle, it, 0U, control_callback, m) != kStatus_USB_Success)
+    {
+        s_lastError = "SET_INTERFACE failed";
+        m->runState = kRun_NextCandidate;
+        notify_app();
+    }
+}
+
+/* Current candidate is not a usable mouse: move on, or give up. */
+static void next_candidate(void)
+{
+    host_mouse_t *m = &s_mouse;
+
+    release_class();
+    m->candidate++;
+    if (m->candidate >= m->candidateCount)
+    {
+        /* Not a mouse (e.g. a keyboard behind the same hub): report it and
+         * let go, so a mouse attached later can still be claimed. */
+        const char *why = (m->candidateCount > 1U) ? "no interface has a mouse collection" : s_lastError;
+        memset(&s_mouse, 0, sizeof(s_mouse));
+        s_mouse.devState = kDev_Idle;
+        app_status_mouse_error(why);
+        return;
+    }
+    start_candidate();
+}
+
 static void mouse_process(void)
 {
     host_mouse_t *m = &s_mouse;
@@ -403,19 +521,9 @@ static void mouse_process(void)
     }
     if (m->devState == kDev_Attached)
     {
-        /* Bind the SDK HID class driver to the claimed interface. */
-        if (USB_HostHidInit(m->deviceHandle, &m->classHandle) != kStatus_USB_Success)
-        {
-            mouse_fail("HID class init failed");
-            return;
-        }
         m->devState = kDev_Running;
-        m->runState = kRun_WaitSetInterface;
-        if (USB_HostHidSetInterface(m->classHandle, m->interfaceHandle, 0U, control_callback, m) !=
-            kStatus_USB_Success)
-        {
-            mouse_fail("SET_INTERFACE failed");
-        }
+        s_lastError = "no mouse collection in report descriptor";
+        start_candidate();
         return;
     }
     if (m->devState != kDev_Running)
@@ -425,9 +533,13 @@ static void mouse_process(void)
 
     switch (m->runState)
     {
+        case kRun_NextCandidate:
+            next_candidate();
+            break;
+
         case kRun_SetInterfaceDone:
         {
-            uint16_t len = find_report_desc_len((usb_host_interface_t *)m->interfaceHandle);
+            uint16_t len = find_report_desc_len(current_interface());
             if ((len == 0U) || (len > sizeof(s_reportDesc)))
             {
                 len = sizeof(s_reportDesc); /* device returns what it has */
@@ -437,7 +549,9 @@ static void mouse_process(void)
             if (USB_HostHidGetReportDescriptor(m->classHandle, s_reportDesc, len, control_callback, m) !=
                 kStatus_USB_Success)
             {
-                mouse_fail("report descriptor request failed");
+                s_lastError = "report descriptor request failed";
+                m->runState = kRun_NextCandidate;
+                notify_app();
             }
             break;
         }
@@ -449,11 +563,13 @@ static void mouse_process(void)
             {
                 if (!m->bootCapable)
                 {
-                    mouse_fail("no mouse collection in report descriptor");
+                    s_lastError = "no mouse collection in report descriptor";
+                    m->runState = kRun_NextCandidate;
+                    notify_app();
                     break;
                 }
-                /* Unparseable descriptor on a boot-capable interface: switch the
-                 * mouse to the spec-defined boot protocol format instead. */
+                /* Unparseable descriptor on a boot mouse interface: switch it
+                 * to the spec-defined boot protocol format instead. */
                 hid_mouse_layout_boot(&m->layout);
                 m->usingBoot = true;
             }
@@ -470,7 +586,7 @@ static void mouse_process(void)
         {
             uint8_t proto =
                 (uint8_t)(m->usingBoot ? USB_HOST_HID_REQUEST_PROTOCOL_BOOT : USB_HOST_HID_REQUEST_PROTOCOL_REPORT);
-            m->runState   = kRun_WaitSetProtocol;
+            m->runState = kRun_WaitSetProtocol;
             if (USB_HostHidSetProtocol(m->classHandle, proto, control_callback, m) != kStatus_USB_Success)
             {
                 m->runState = kRun_SetProtocolDone;
@@ -480,6 +596,7 @@ static void mouse_process(void)
         }
 
         case kRun_SetProtocolDone:
+        {
             /* Start streaming. The pipe polls at the mouse's own bInterval
              * (e.g. 1 ms FS, or 125 us for an 8 kHz HS mouse). */
             m->inPacketSize = USB_HostHidGetPacketsize(m->classHandle, USB_ENDPOINT_INTERRUPT, USB_IN);
@@ -487,16 +604,30 @@ static void mouse_process(void)
             {
                 m->inPacketSize = APP_HOST_REPORT_BUF_SIZE;
             }
-            m->rxIndex  = 0U;
-            m->runState = kRun_Streaming;
             /* Publish before the first report can arrive. */
+            app_status_mouse_attached(device_info(m->deviceHandle, kUSB_HostGetDeviceVID),
+                                      device_info(m->deviceHandle, kUSB_HostGetDevicePID),
+                                      (uint8_t)device_info(m->deviceHandle, kUSB_HostGetDeviceSpeed),
+                                      current_interface()->interfaceDesc->bInterfaceNumber,
+                                      device_info(m->deviceHandle, kUSB_HostGetDeviceHubNumber) != 0U);
             app_status_mouse_ready(&m->layout, m->usingBoot, m->inPacketSize);
-            if (USB_HostHidRecv(m->classHandle, s_rxBuf[0], m->inPacketSize, mouse_in_callback, m) !=
-                kStatus_USB_Success)
+            m->runState = kRun_Streaming;
+
+            uint8_t queued = 0U;
+            for (uint8_t b = 0U; b < RX_BUFFERS; b++)
+            {
+                if (USB_HostHidRecv(m->classHandle, s_rxBuf[b], m->inPacketSize, mouse_in_callback, m) ==
+                    kStatus_USB_Success)
+                {
+                    queued++;
+                }
+            }
+            if (queued == 0U)
             {
                 mouse_fail("interrupt IN transfer failed");
             }
             break;
+        }
 
         default:
             break; /* waiting for a callback, streaming, or error */
@@ -556,6 +687,7 @@ void usb_host_app_task(void *arg)
     (void)arg;
     s_appTask = xTaskGetCurrentTaskHandle();
     memset(&s_mouse, 0, sizeof(s_mouse));
+    watch_checkin(WATCH_USB_HOST, app_now_ms());
 
     /* 1) VBUS must be HIGH before the host stack is initialised. */
     vbus_power_sequence();
@@ -566,6 +698,7 @@ void usb_host_app_task(void *arg)
     {
         /* USB1 and the command channel keep working; the LED shows a fault. */
         app_status_host_init_failed();
+        watch_park(WATCH_USB_HOST);
         for (;;)
         {
             vTaskDelay(portMAX_DELAY);
@@ -583,6 +716,7 @@ void usb_host_app_task(void *arg)
     for (;;)
     {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+        watch_checkin(WATCH_USB_HOST, app_now_ms());
 
         mouse_process();
 

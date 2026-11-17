@@ -17,9 +17,10 @@
 #define APP_UART_DMA_CHANNEL        0U        /* eDMA channel used for RX     */
 #define APP_CMD_MAX_LINE            96U       /* longest accepted command     */
 #define APP_CMD_SLEEP_MAX_MS        600000U   /* cmd.sleep() upper bound      */
-#define APP_FW_VERSION              "1.0.0"
+#define APP_FW_VERSION              "1.1.0"
 #define APP_DEVICE_INFO             "HID-Proxy-RT1062"
-#define APP_LED_REFRESH_MS          20U       /* status LED update period     */
+#define APP_SYSTEM_TICK_MS          10U       /* system task period (LED,
+                                                 watchdog, suspend, settings) */
 
 /* ------------------------------------------------------------------------- */
 /* Injection behaviour                                                       */
@@ -40,6 +41,42 @@
 #define APP_SMOOTH_MAX_MS           1000U     /* cmd.smooth() upper bound     */
 
 /* ------------------------------------------------------------------------- */
+/* QSPI NOR layout (offsets from the start of the flash, mapped at           */
+/* APP_FLASH_BASE). Needs a flash of at least 2 MB + 8 KB.                    */
+/*                                                                           */
+/*   0x000000  running image: FCB, IVT, vectors, code     APP_SLOT_SIZE      */
+/*   0x100000  staging area for cmd.update                APP_SLOT_SIZE      */
+/*   0x200000  settings, two sectors used alternately     2 x 4 KB           */
+/* ------------------------------------------------------------------------- */
+#define APP_FLASH_BASE              0x60000000U
+#define APP_FLASH_PAGE_SIZE         256U
+#define APP_FLASH_SECTOR_SIZE       4096U
+#define APP_SLOT_SIZE               0x100000U /* also the linker's text limit  */
+#define APP_STAGING_OFFSET          0x100000U
+#define APP_SETTINGS_OFFSET         0x200000U
+
+/* Saved settings: written this long after the last change (debounce).      */
+#define APP_SETTINGS_SAVE_DELAY_MS  1000U
+
+/* Firmware update over the command UART (fw_update.h).                      */
+#define APP_UPDATE_CHUNK            1024U  /* bytes per acknowledged chunk  */
+#define APP_UPDATE_TIMEOUT_MS       5000U  /* silence that aborts an update */
+
+/* ------------------------------------------------------------------------- */
+/* Watchdog (WDOG1)                                                          */
+/* ------------------------------------------------------------------------- */
+#ifndef APP_WATCHDOG_ENABLE
+#define APP_WATCHDOG_ENABLE         1
+#endif
+#define APP_WDOG_TIMEOUT_MS         2000U  /* reset if not fed for this long */
+#define APP_WDOG_TASK_DEADLINE_MS   1000U  /* max silence of a watched task */
+
+/* ------------------------------------------------------------------------- */
+/* Suspend / remote wake-up                                                  */
+/* ------------------------------------------------------------------------- */
+#define APP_RESUME_SIGNAL_MS        10U    /* USB 2.0: 1..15 ms             */
+
+/* ------------------------------------------------------------------------- */
 /* USB device (USB1 / USB_OTG1 / kUSB_ControllerEhci0)                       */
 /* ------------------------------------------------------------------------- */
 /* PLACEHOLDER IDs - you must use a VID/PID you are entitled to use.         */
@@ -48,7 +85,8 @@
 #define APP_USB_BCD_DEVICE          0x0100U
 
 #define APP_HID_IN_EP               1U        /* EP1 IN                       */
-#define APP_HID_IN_MPS              8U        /* report is 6 bytes            */
+#define APP_HID_IN_MPS              16U       /* report is 8 bytes; larger MPS
+                                                 keeps it a short packet       */
 #define APP_HID_IN_INTERVAL_HS      1U        /* 2^(1-1) uframes = 125 us     */
 #define APP_HID_IN_INTERVAL_FS      1U        /* 1 frame = 1 ms (fallback)    */
 
@@ -67,13 +105,13 @@
 #define APP_PRIO_INIT               5U  /* one-shot bring-up task             */
 #define APP_PRIO_USB_HOST_APP       4U  /* enumeration state machine          */
 #define APP_PRIO_UART_PARSER        3U  /* command parser (medium)            */
-#define APP_PRIO_STATUS_LED         1U  /* status LED (lowest)                */
+#define APP_PRIO_SYSTEM             1U  /* LED, watchdog, settings (lowest)   */
 
 #define APP_STACK_USB_HOST_STACK    1024U  /* words */
 #define APP_STACK_USB_HOST_APP      1024U
 #define APP_STACK_UART_PARSER       768U
 #define APP_STACK_INIT              768U
-#define APP_STACK_STATUS_LED        256U
+#define APP_STACK_SYSTEM            512U
 
 /* ------------------------------------------------------------------------- */
 /* NVIC priorities (0 = highest). configPRIO_BITS = 4 on RT1062.             */
