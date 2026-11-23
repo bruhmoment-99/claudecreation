@@ -34,6 +34,10 @@
 
 [Protocols]
   gEfiSmmAccess2ProtocolGuid      ## CONSUMES (at entry, to learn the SMRAM ranges)
+  gEfiSmmVariableProtocolGuid     ## CONSUMES (SMM-side variable read/write, Phase 6)
+  gEdkiiSmmVarCheckProtocolGuid   ## CONSUMES (mark LabBootCounter read-only for ring 0)
 
 [Depex]
-  gEfiSmmAccess2ProtocolGuid
+  gEfiSmmAccess2ProtocolGuid AND
+  gEfiSmmVariableProtocolGuid AND
+  gEdkiiSmmVarCheckProtocolGuid

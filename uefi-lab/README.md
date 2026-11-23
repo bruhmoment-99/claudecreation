@@ -14,6 +14,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 3 | UEFI driver + protocols, boot vs. runtime services, OS handoff | [`phase3-driver/`](phase3-driver) |
 | 4 | Ring -2: our own SMI handler in SMRAM, in our own firmware build | [`phase4-smm/`](phase4-smm) |
 | 5 | Our own bootloader + our own kernel: page tables, interrupts, framebuffer, a shell | [`phase5-kernel/`](phase5-kernel) |
+| 6 | Ring -2 guards the flash: only SMM may write firmware storage, and our handler owns a variable ring 0 can't change | [`phase6-smm-flash/`](phase6-smm-flash) |
 
 ## Quick start (Windows 11)
 
@@ -22,7 +23,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2 to 5 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds phases 2 to 6 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -52,6 +53,7 @@ uefi-lab\
   phase3-driver\               loader.c, driver.c, lab_protocol.h, build.cmd, run.cmd
   phase4-smm\                  LabSmmPkg\ (SMM driver), firmware\bin\ (prebuilt OVMF), app\, run.cmd
   phase5-kernel\               loader\ (bootloader), kernel\ (our kernel), include\boot.h, run.cmd
+  phase6-smm-flash\            app\flashguard.c (uses phase4-smm's firmware), run.cmd
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -338,6 +340,73 @@ Shell commands:
 - Use the local APIC timer instead of the PIT, then find the I/O APIC
   through the ACPI tables (`acpi_rsdp` is already in `BOOT_INFO`).
 - Add a ring 3 "user program": a TSS, user segments, and a `syscall` entry point.
+
+## Phase 6 — ring -2 guards the flash
+
+```bat
+phase6-smm-flash\run.cmd -Headless
+```
+
+On a real PC, the SPI flash chip holds the firmware **and** the UEFI
+variable store: boot order, Secure Boot keys, settings. If ring 0 could write
+that chip, malware could rewrite the firmware and survive a reinstall. So the
+chipset only lets **SMM** write flash, and every variable write passes
+through code running in SMM, which decides whether to allow it. This phase
+shows both layers, using the same firmware and `LabSmmHandler` as Phase 4.
+
+What changed in `phase4-smm/LabSmmPkg/LabSmmHandler/LabSmmHandler.c`:
+- At load time (before `EndOfDxe` locks the rules), the handler marks the
+  variable `LabBootCounter` **read-only for every caller outside SMM**, through
+  `EDKII_SMM_VAR_CHECK_PROTOCOL`.
+- A new command, `LAB_CMD_INCREMENT_COUNTER`, reads the variable, adds one and
+  writes it back through `EFI_SMM_VARIABLE_PROTOCOL`. Because that call comes
+  from inside SMM, the variable driver treats it as **trusted**.
+- The root handler now counts every SMI (`TotalSmis`), so ring 0 can see
+  when its requests secretly went into SMM.
+
+Real output, second boot:
+```
+[SMM] LabBootCounter is now read-only outside SMM
+[1] Ring 0 READS the flash chip (allowed)
+    variable store at 0x00000000FFC00000: firmware volume signature "_FVH" found
+[2] Ring 0 WRITES the flash chip directly
+    target 0x00000000FFC83FFF holds 0x...FF
+    sending CFI 'program byte' (0x40) then 0x00 to it...
+    read back: 0x...FF  -> DROPPED: outside SMM the chipset ignores flash writes
+[3] Ring 0 calls SetVariable(LabBootCounter = 999)
+    SMIs while it ran: 1 (the variable driver lives in SMM, so the request went there)
+    status 0x8000000000000008 = EFI_WRITE_PROTECTED: SMM refused an untrusted caller
+[4] Ring 0 reads LabBootCounter: 1
+    asking OUR SMM handler to increment it...
+    SMM wrote it to flash: LabBootCounter = 2
+    ring 0 GetVariable reads back 2 - stored
+```
+
+The two layers of protection:
+
+| Layer | What enforces it | What ring 0 sees |
+|---|---|---|
+| **Hardware:** flash writes only from SMM | the chipset; in QEMU, `cfi.pflash01` `secure=on` | step [2]: the flash command is silently ignored |
+| **Policy:** which variables may change | SMM's variable driver, with our read-only rule | step [3]: `SetVariable` returns `EFI_WRITE_PROTECTED` |
+
+The value lives in `phase6-smm-flash\ovmf_vars.fd`, which is the emulated
+flash chip, so every run adds one. Delete that file to reset it.
+
+### Try it: switch the hardware protection off
+In `tools\common.ps1` (or `run.sh`), remove
+`-global driver=cfi.pflash01,property=secure,value=on` and run again. Step
+[2] now reports that the write **went through**: the byte changes from `FF`
+to `00`. Without the SMM-only rule, any ring 0 code could rewrite the
+firmware's storage. (It only touched an unused byte of your emulated flash
+file. Delete `ovmf_vars.fd` afterwards to start clean.)
+
+### Why the SMM side is trusted
+In EDK II, `VariableSmm.c` sets `mRequestSource = VarCheckFromTrusted` only
+while serving `EFI_SMM_VARIABLE_PROTOCOL` calls, which only SMM code can
+make. Requests that arrive from ring 0 through the communication buffer are
+`VarCheckFromUntrusted`, and `VarCheckLib` refuses those for read-only
+variables. The same mechanism protects real platform settings that only
+firmware may change.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs

@@ -33,6 +33,16 @@ $results['phase4-smm'] = Test-LabVm "$PSScriptRoot\phase4-smm" @(
     '[SMM] ring -2 here: software SMI 0x5A',
     'SMM answered') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin"
 
+Write-Host "`n== Phase 6: SMM guards the flash ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase6-smm-flash\build.ps1"
+$results['phase6-smm-flash'] = Test-LabVm "$PSScriptRoot\phase6-smm-flash" @(
+    '[SMM] LabBootCounter is now read-only outside SMM',
+    '"_FVH" found',
+    'DROPPED: outside SMM the chipset ignores flash writes',
+    'EFI_WRITE_PROTECTED: SMM refused an untrusted caller',
+    'SMM wrote it to flash: LabBootCounter =',
+    '- stored') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin"
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.

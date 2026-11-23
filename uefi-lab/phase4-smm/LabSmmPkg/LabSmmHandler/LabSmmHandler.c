@@ -30,6 +30,8 @@
 
 #include <PiSmm.h>
 #include <Protocol/SmmAccess2.h>
+#include <Protocol/SmmVariable.h>
+#include <Protocol/SmmVarCheck.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/SmmServicesTableLib.h>
 #include <Library/SmmMemLib.h>
@@ -43,6 +45,10 @@ STATIC UINT64  mCallCount;
 STATIC UINT64  mSmramBase;
 STATIC UINT64  mSmramSize;
 STATIC UINT64  mMailbox;        /* physical address registered via SET_MAILBOX, 0 = none */
+STATIC UINT64  mTotalSmis;      /* every SMI, counted by the root handler */
+STATIC EFI_SMM_VARIABLE_PROTOCOL  *mSmmVariable;
+
+#define COUNTER_ATTRIBUTES  (EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS)
 
 EFI_STATUS EFIAPI LabGuidHandler (EFI_HANDLE, CONST VOID *, VOID *, UINTN *);
 
@@ -97,6 +103,43 @@ SerialDec (UINT64 V)
   SerialPuts (&Buf[I]);
 }
 
+/* ---- Phase 6: the SMM-only counter in flash ----
+   Ring 0's SetVariable() also ends up in SMM (the variable driver lives
+   there), but it arrives as an UNTRUSTED request, and LabBootCounter is
+   marked read-only for those. Calls made through EFI_SMM_VARIABLE_PROTOCOL
+   come from inside SMM and are TRUSTED, so only this code can change it.
+   The bytes land in the flash chip, which the chipset lets only SMM write. */
+STATIC EFI_STATUS
+IncrementCounter (
+  OUT UINT64  *NewValue
+  )
+{
+  EFI_GUID    Guid = LAB_SMM_COMM_GUID;
+  UINT64      Value = 0;
+  UINTN       Size  = sizeof (Value);
+  UINT32      Attributes;
+  EFI_STATUS  Status;
+
+  if (mSmmVariable == NULL) {
+    return EFI_NOT_READY;
+  }
+
+  Status = mSmmVariable->SmmGetVariable (LAB_SMM_COUNTER_NAME, &Guid, &Attributes, &Size, &Value);
+  if (Status == EFI_NOT_FOUND) {
+    Value = 0;
+  } else if (EFI_ERROR (Status) || (Size != sizeof (Value))) {
+    return EFI_ERROR (Status) ? Status : EFI_BAD_BUFFER_SIZE;
+  }
+
+  Value++;
+  Status = mSmmVariable->SmmSetVariable (LAB_SMM_COUNTER_NAME, &Guid, COUNTER_ATTRIBUTES, sizeof (Value), &Value);
+  if (!EFI_ERROR (Status)) {
+    *NewValue = Value;
+  }
+
+  return Status;
+}
+
 /* ---- The actual work, on a private SMRAM copy of the request. ---- */
 STATIC VOID
 ProcessMessage (
@@ -112,6 +155,7 @@ ProcessMessage (
   Msg->SmramBase      = mSmramBase;
   Msg->SmramSize      = mSmramSize;
   Msg->HandlerAddress = (UINT64)(UINTN)LabGuidHandler;
+  Msg->TotalSmis      = mTotalSmis;
   Msg->Status         = LAB_STATUS_OK;
 
   switch (Msg->Command) {
@@ -136,6 +180,17 @@ ProcessMessage (
       }
 
       break;
+
+    case LAB_CMD_INCREMENT_COUNTER:
+    {
+      EFI_STATUS  Status = IncrementCounter (&Msg->Value);
+      if (EFI_ERROR (Status)) {
+        Msg->Status = LAB_STATUS_FAILED;
+        Msg->Arg    = Status;
+      }
+
+      break;
+    }
 
     default:
       Msg->Status = LAB_STATUS_BAD_COMMAND;
@@ -193,6 +248,8 @@ LabRootHandler (
   )
 {
   LAB_SMM_MSG  Local;
+
+  mTotalSmis++;   /* the SMM core calls root handlers on every SMI */
 
   if (IoRead8 (LAB_SMM_APM_CNT_PORT) != LAB_SMM_SW_SMI_VALUE) {
     return EFI_WARN_INTERRUPT_SOURCE_PENDING;     /* not ours */
@@ -252,6 +309,32 @@ LabSmmHandlerEntry (
         }
       }
     }
+  }
+
+  /* Phase 6: make LabBootCounter read-only for everyone outside SMM.
+     Variable properties can only be set before EndOfDxe; after that the
+     list is locked, so ring 0 can't remove this rule later. */
+  {
+    EDKII_SMM_VAR_CHECK_PROTOCOL  *VarCheck;
+    VAR_CHECK_VARIABLE_PROPERTY   Property;
+
+    Status = gSmst->SmmLocateProtocol (&gEfiSmmVariableProtocolGuid, NULL, (VOID **)&mSmmVariable);
+    if (EFI_ERROR (Status)) {
+      mSmmVariable = NULL;
+    }
+
+    Status = gSmst->SmmLocateProtocol (&gEdkiiSmmVarCheckProtocolGuid, NULL, (VOID **)&VarCheck);
+    if (!EFI_ERROR (Status)) {
+      Property.Revision   = VAR_CHECK_VARIABLE_PROPERTY_REVISION;
+      Property.Property   = VAR_CHECK_VARIABLE_PROPERTY_READ_ONLY;
+      Property.Attributes = COUNTER_ATTRIBUTES;
+      Property.MinSize    = sizeof (UINT64);
+      Property.MaxSize    = sizeof (UINT64);
+      Status = VarCheck->SmmVariablePropertySet (LAB_SMM_COUNTER_NAME, &gLabSmmCommGuid, &Property);
+    }
+
+    SerialPuts (EFI_ERROR (Status) ? "[SMM] could not protect LabBootCounter\n"
+                                   : "[SMM] LabBootCounter is now read-only outside SMM\n");
   }
 
   Handle = NULL;

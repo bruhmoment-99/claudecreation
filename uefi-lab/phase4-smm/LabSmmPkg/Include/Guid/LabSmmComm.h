@@ -26,17 +26,23 @@
 #define LAB_CMD_PING         1  /* who are you? counters, CPU info, addresses   */
 #define LAB_CMD_READ_SMRAM   2  /* return the first 32 bytes of our own handler  */
 #define LAB_CMD_SET_MAILBOX  3  /* Arg = physical address of a 4 KiB mailbox     */
+#define LAB_CMD_INCREMENT_COUNTER 4  /* SMM adds 1 to the LabBootCounter variable  */
+
+/* LabBootCounter: a UEFI variable stored in flash that ring 0 may READ but
+   not write. Only our SMM handler can change it (Phase 6). */
+#define LAB_SMM_COUNTER_NAME  L"LabBootCounter"   /* vendor GUID = LAB_SMM_COMM_GUID */
 
 /* Status codes written back by the handler */
 #define LAB_STATUS_OK           0
 #define LAB_STATUS_BAD_COMMAND  1
 #define LAB_STATUS_REJECTED     2  /* pointer failed validation (e.g. points into SMRAM) */
+#define LAB_STATUS_FAILED       3  /* the operation failed; Arg holds the EFI_STATUS */
 
 #pragma pack(1)
 typedef struct {
   UINT32  Command;        /* in  */
   UINT32  Status;         /* out */
-  UINT64  Arg;            /* in  (command specific) */
+  UINT64  Arg;            /* in: command argument; out: EFI_STATUS on LAB_STATUS_FAILED */
   UINT64  Magic;          /* out: LAB_SMM_MAGIC proves SMM code answered */
   UINT64  CallCount;      /* out: requests served; lives in SMRAM, survives between SMIs */
   UINT64  CpuIndex;       /* out: which CPU is running the SMI handler */
@@ -44,6 +50,8 @@ typedef struct {
   UINT64  SmramBase;      /* out: start of the SMRAM (TSEG) range */
   UINT64  SmramSize;      /* out */
   UINT64  HandlerAddress; /* out: where our handler code sits - inside SMRAM */
+  UINT64  TotalSmis;      /* out: every SMI SMM has handled so far, ours or not */
+  UINT64  Value;          /* out: INCREMENT_COUNTER result */
   UINT8   Data[32];       /* out: READ_SMRAM result */
 } LAB_SMM_MSG;
 #pragma pack()
