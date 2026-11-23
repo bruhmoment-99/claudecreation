@@ -18,6 +18,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 7 | The same handler in **Standalone MM**, the newer, isolated ring -2 architecture, compared with Traditional MM | [`phase7-standalone-mm/`](phase7-standalone-mm) |
 | 8 | Debugging ring -2: breakpoints, source stepping and memory reads **inside SMM** with LLDB/GDB | [`phase8-smm-gdb/`](phase8-smm-gdb) |
 | 9 | How SMM protects **itself**: read-only code, no-execute data, no jumping into OS memory | [`phase9-smm-selfprotect/`](phase9-smm-selfprotect) |
+| 10 | **Secure Boot**: enroll your own keys, watch the firmware refuse unknown and tampered programs | [`phase10-secure-boot/`](phase10-secure-boot) |
 
 ## Quick start (Windows 11)
 
@@ -61,6 +62,7 @@ uefi-lab\
   phase7-standalone-mm\        app\mmcompare.c (runs on both firmware builds), run.cmd
   phase8-smm-gdb\              app\smmdebug.c, debug.cmd (LLDB), debug.sh (GDB/LLDB)
   phase9-smm-selfprotect\      app\smmguard.c, run.cmd (-Standalone)
+  phase10-secure-boot\         app\secureboot.c (+ trusted.c, untrusted.c), keys\, run.cmd (-Reset)
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -586,6 +588,74 @@ ExceptionData - 0000000000000003  I:0 R:0 U:0 W:1 P:1 PK:0 SS:0 SGX:0
 ```
 `W:1 P:1` means a **write** to a **present** page that's read-only. Phase 8's
 debugger can stop on that fault too.
+
+## Phase 10 — Secure Boot
+
+```bat
+phase10-secure-boot\run.cmd -Headless          :: boot 1: enroll keys + test
+phase10-secure-boot\run.cmd -Headless          :: boot 2: the firmware checks this app first
+phase10-secure-boot\run.cmd -Headless -Reset   :: wipe the emulated flash, back to setup mode
+```
+
+Secure Boot means the firmware refuses to run any program that isn't
+approved in the **db** variable. Three UEFI variables control it:
+
+| Variable | Role |
+|---|---|
+| **PK** (Platform Key) | the platform owner; signs changes to KEK |
+| **KEK** (Key Exchange Key) | signs changes to db |
+| **db** (allowed list) | certificates or SHA-256 hashes of programs allowed to run |
+
+They live in the flash chip, and only the variable driver **in SMM** can
+write them (Phase 6). While no PK is enrolled the platform is in **setup
+mode** and enforces nothing. Enrolling a PK switches it to **user mode**, and
+from then on every change must be signed.
+
+No signing tools are needed. The app computes the **Authenticode SHA-256**
+of each program itself, the same digest the firmware checks (see
+`authenticode_sha256` in `app/secureboot.c`, with its own SHA-256 in
+`app/sha256.h`). It enrolls those hashes in db. PK and KEK hold a test
+certificate whose **private key was destroyed** when it was made. So once
+enrolled, nobody can sign a change to db, not even us. Wiping the emulated
+flash (`-Reset`) is the only way back.
+
+Real output, first boot:
+```
+[1] SetupMode = 1 (setup mode: no PK, nothing enforced), SecureBoot = 0
+[2] untrusted.efi: ALLOWED                                   <- no keys yet
+[3] db  += SHA-256 of BOOTX64.EFI (this app): ab6cd7af294dafec...
+    db  += SHA-256 of trusted.efi:            f32bcd1e2c04407a...
+    write db : EFI_SUCCESS   write KEK: EFI_SUCCESS   write PK : EFI_SUCCESS
+    SetupMode = 0 (user mode: PK enrolled), SecureBoot = 1
+[4] trusted.efi           (hash in db): ALLOWED
+      [trusted.efi] Hello! The firmware checked my hash and let me run.
+    untrusted.efi         (not in db): REFUSED by the firmware (EFI_ACCESS_DENIED)
+    trusted.efi, 1 bit flipped     : REFUSED by the firmware (EFI_ACCESS_DENIED)
+[5] add untrusted.efi's hash to db (unsigned): EFI_SECURITY_VIOLATION
+    delete PK to turn Secure Boot off (unsigned): EFI_SECURITY_VIOLATION
+    SMIs while ring 0 tried: 2
+```
+On the second boot, the firmware checks `BOOTX64.EFI` against db **before**
+starting it. As a control, I flipped one bit in a copy of the app and booted
+it. The firmware refused:
+```
+BdsDxe: failed to load Boot0002 ... Access Denied -- rejected probably by Secure Boot
+```
+What it shows:
+- **A single flipped bit is enough.** The hash no longer matches, so the
+  program doesn't run. That's what stops a modified bootloader.
+- **The rules protect themselves.** Ring 0 can't add its own program to db
+  or delete the PK without a valid signature. Both requests go into SMM
+  (2 SMIs), and SMM's variable driver refuses them.
+- **Why setup mode is dangerous:** before a PK is enrolled, anything runs and
+  anyone can enroll keys. Real PCs ship with keys already enrolled.
+
+After keys are enrolled, rebuilding the app changes its hash, so the firmware
+won't start it anymore. Run with `-Reset` after rebuilding. Phase 10's
+flash file is separate, so other phases aren't affected. The firmware image
+(`phase4-smm\firmware\bin`) is built with `SECURE_BOOT_ENABLE=TRUE`. With an
+empty flash it stays in setup mode, which is why phases 4, 6, 8 and 9 behave
+exactly as before.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs

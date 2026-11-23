@@ -80,6 +80,19 @@ $c = Test-LabVm $p9 @('about to write to my own code page', '!!!! X64 Exception 
 Remove-Item $p9marker
 $results['phase9-smm-selfprotect'] = $a -and $b -and $c
 
+Write-Host "`n== Phase 10: Secure Boot ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase10-secure-boot\build.ps1"
+$p10 = "$PSScriptRoot\phase10-secure-boot"
+$fw10 = "$PSScriptRoot\phase4-smm\firmware\bin"
+# Boot 1 from a clean flash: enroll keys, then test.
+$a = Test-LabVm $p10 @('SetupMode = 1', 'untrusted.efi: ALLOWED', 'write PK : EFI_SUCCESS', 'SecureBoot = 1',
+    'trusted.efi           (hash in db): ALLOWED', 'untrusted.efi         (not in db): REFUSED',
+    '1 bit flipped     : REFUSED', 'add untrusted.efi''s hash to db (unsigned): EFI_SECURITY_VIOLATION',
+    '-> Secure Boot works') -FirmwareDir $fw10 -FreshVars
+# Boot 2 on the same flash: the firmware must check THIS app first.
+$b = Test-LabVm $p10 @("The firmware checked THIS app's hash against db", '-> Secure Boot works') -FirmwareDir $fw10
+$results['phase10-secure-boot'] = $a -and $b
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.
