@@ -1,44 +1,63 @@
-# UEFI Lab — writing your own firmware (UEFI → ring -2 SMM)
+# UEFI Lab — writing your own firmware (UEFI → ring -2 SMM), on Windows 11
 
-You learn this in an emulator first, so nothing can brick. The real-hardware
-phase is optional and uses a separate board, never your daily driver.
+You develop on Windows 11. The firmware code runs in **QEMU**, an emulator,
+on top of **OVMF**, open-source UEFI firmware. Nothing here touches your PC's
+real firmware, Secure Boot or BitLocker, and nothing can brick it.
 
-| Phase | What | Status |
+> These scripts only run if you run them. Nothing in this repo runs on its own.
+
+| Phase | What | Folder |
 |---|---|---|
 | 0 | Mental model: ring 3 → 0 → -1 (hypervisor) → -2 (SMM) → -3 (ME/PSP) | — |
-| 1 | Toolchain: LLVM/Clang + lld-link, QEMU + OVMF | ✅ |
-| 2 | First UEFI app → `BOOTX64.EFI`, boot in QEMU/OVMF | ✅ [`phase2-hello/`](phase2-hello) |
-| 3 | UEFI driver + protocols, boot vs. runtime services, OS handoff | ✅ [`phase3-driver/`](phase3-driver) |
-| 4 | Ring -2: a `DXE_SMM_DRIVER` / SMI handler in EDK II (emulator) | next |
-| 5 | Real hardware: Boot-Guard-free coreboot board (e.g. ThinkPad X230) + CH341A clip | optional |
+| 1 | Toolchain: LLVM/Clang + lld-link, QEMU + OVMF | `setup.cmd` |
+| 2 | First UEFI app → `BOOTX64.EFI` | [`phase2-hello/`](phase2-hello) |
+| 3 | UEFI driver + protocols, boot vs. runtime services, OS handoff | [`phase3-driver/`](phase3-driver) |
+| 4 | Ring -2: an SMI handler in SMRAM (emulator) | next |
 
-> ⚠️ Phase 5 is **not** for a B760M / 14th-gen Intel board. Intel Boot Guard is
-> fused in at the factory there, so the CPU refuses unsigned firmware.
+## Quick start (Windows 11)
 
-## Phase 1 — toolchain
+Open the `uefi-lab` folder in File Explorer or a terminal, then:
 
-**Windows** (accept the UAC prompt for each):
-```powershell
-winget install LLVM.LLVM
-winget install SoftwareFreedomConservancy.QEMU
+| Step | Run | What it does |
+|---|---|---|
+| 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
+| 2 | `selftest.cmd` | Builds phases 2 and 3 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
+|   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
+
+The `.cmd` files are thin wrappers around the `.ps1` scripts. They exist
+because Windows 11 blocks `.ps1` files by default ("running scripts is
+disabled on this system"). They bypass that for the one script only, and
+don't change any system setting.
+
+Each phase also has `build.cmd` (compile only) and `run.cmd` (builds first if
+needed).
+
+### What setup installs
+| Tool | winget id | Default location |
+|---|---|---|
+| LLVM (clang + lld-link) | `LLVM.LLVM` | `C:\Program Files\LLVM\bin` |
+| QEMU (+ OVMF in `share\edk2-x86_64-code.fd`) | `SoftwareFreedomConservancy.QEMU` | `C:\Program Files\qemu` |
+
+The scripts find these even if the installers didn't add them to `PATH`. If
+your OVMF files are somewhere else, set `LAB_OVMF_CODE` and `LAB_OVMF_VARS`.
+
+### Layout
 ```
-QEMU for Windows already includes OVMF (`share\edk2-x86_64-code.fd`).
-
-**Linux / WSL:**
-```bash
-sudo apt install clang lld qemu-system-x86 ovmf
+uefi-lab\
+  setup.cmd / selftest.cmd     one-time setup, build + boot everything
+  tools\common.ps1             shared helpers: find tools, build .efi, start QEMU
+  phase2-hello\                main.c, efi.h, build.cmd, run.cmd
+  phase3-driver\               loader.c, driver.c, lab_protocol.h, build.cmd, run.cmd
 ```
+Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
+VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
 
-## Phase 2 — run it
+## Phase 2 — first UEFI application
 
-Windows:
-```powershell
-.\phase2-hello\build.ps1
-.\phase2-hello\run.ps1          # -Headless for serial output in the terminal
-```
-Linux:
-```bash
-./phase2-hello/build.sh && ./phase2-hello/run.sh --headless
+```bat
+phase2-hello\build.cmd
+phase2-hello\run.cmd
 ```
 
 Example output (OVMF, 256 MiB VM):
@@ -57,6 +76,7 @@ Memory map: 127 descriptors
   Conventional: 208 MiB
   ...
 ```
+(QEMU for Windows ships its own OVMF build, so the vendor string and numbers will differ a little.)
 
 ### What to read in the code
 - **`efi.h`**: the UEFI structs typed out by hand, with no EDK II or gnu-efi.
@@ -64,31 +84,27 @@ Memory map: 127 descriptors
   are all there.
 - **`main.c`**:
   - The entry point is `efi_main(ImageHandle, SystemTable)`. It uses the MS x64
-    ABI (`EFIAPI`) because UEFI follows the PE/Windows calling convention.
+    ABI (`EFIAPI`), because UEFI follows the Windows PE calling convention.
+    That's also why the compiler target is `x86_64-unknown-windows`.
   - Everything goes through `SystemTable`: `ConOut` for text, `ConIn` for
     keys, `BootServices` for memory and timers, `RuntimeServices` for reset.
-  - `GetMemoryMap` uses the usual "ask for the size, allocate, ask again" pattern.
-    Step through descriptors by `DescriptorSize`, not `sizeof`.
-  - **Boot vs. runtime services:** the `BootServices*` regions are released
-    when an OS loader calls `ExitBootServices()`. The `RuntimeServices*`
-    regions stay mapped for the OS. That's the Phase 3 handoff.
+  - `GetMemoryMap` uses the usual "ask for the size, allocate, ask again"
+    pattern. Step through descriptors by `DescriptorSize`, not `sizeof`.
   - The big `Reserved` total on q35 comes from firmware-reserved address
     space such as the PCIe ECAM window, not from RAM.
 
-### Build flags explained
-`-target x86_64-unknown-windows`: UEFI images are PE32+, so we target the
-Windows object format. `-ffreestanding -nostdlib`: there is no libc.
+### Build flags explained (see `Invoke-EfiBuild` in `tools\common.ps1`)
+`-target x86_64-unknown-windows`: UEFI images are PE32+ files, the same
+format as Windows `.exe`s. `-ffreestanding -nostdlib`: there is no C runtime.
 `-mno-red-zone`: firmware interrupts can overwrite the red zone.
 `-fshort-wchar`: `CHAR16` strings (`u"..."`). `-subsystem:efi_application`:
 sets the PE subsystem field to 10 so firmware accepts the image.
 
 ## Phase 3 — driver, protocols, handoff
 
-```bash
-./phase3-driver/build.sh && ./phase3-driver/run.sh --headless
-```
-```powershell
-.\phase3-driver\build.ps1 ; .\phase3-driver\run.ps1 -Headless
+```bat
+phase3-driver\build.cmd
+phase3-driver\run.cmd -Headless
 ```
 
 Two images go onto the emulated ESP:
@@ -159,3 +175,17 @@ Real output:
   attach it to a device handle with `ConnectController`.
 - Build it as `efi_runtime_driver` with its data in `EfiRuntimeServicesData`,
   then call it after `ExitBootServices`.
+
+## Phase 4 preview
+
+The QEMU for Windows installer already includes an SMM-enabled OVMF
+(`share\edk2-x86_64-secure-code.fd`, run with `-machine q35,smm=on`). That
+means the first ring -2 experiments can run on Windows without building
+EDK II yourself.
+
+## Also works on Linux / WSL
+Every phase has `build.sh` and `run.sh` that do the same thing (needs
+`clang lld qemu-system-x86 ovmf`). Every phase was tested that way in a cloud
+Linux container. The Windows scripts were written for Windows PowerShell 5.1
+(built into Windows 11) and drive the same compiler flags and QEMU command
+line, but they haven't been run on a Windows machine yet.

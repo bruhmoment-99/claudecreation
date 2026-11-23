@@ -1,2 +1,3 @@
 esp/
 ovmf_vars.fd
+serial.log
