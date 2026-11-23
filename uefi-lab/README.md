@@ -269,7 +269,10 @@ committed.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs
-`clang lld qemu-system-x86 ovmf`). Phase 4's firmware build is Linux-only. Every phase was tested that way in a cloud
-Linux container. The Windows scripts were written for Windows PowerShell 5.1
-(built into Windows 11) and drive the same compiler flags and QEMU command
-line, but they haven't been run on a Windows machine yet.
+`clang lld qemu-system-x86 ovmf`). Phase 4's firmware build is Linux-only.
+
+## Continuous testing on Windows
+Every push runs `.github/workflows/windows-selftest.yml` on a GitHub-hosted
+Windows Server 2025 runner. It installs QEMU, runs `setup.cmd` and
+`selftest.cmd` through Windows PowerShell 5.1 exactly as you would, and
+uploads each phase's `serial.log` as an artifact. All three phases pass there.
