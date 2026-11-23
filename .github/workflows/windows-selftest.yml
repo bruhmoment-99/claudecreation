@@ -33,8 +33,13 @@ jobs:
           & "$env:ProgramFiles\qemu\qemu-system-x86_64.exe" --version
           Get-ChildItem "$env:ProgramFiles\qemu\share\edk2-*" | Select-Object Name, Length
           # LLDB (Phase 8) is linked against one specific Python DLL on Windows.
-          & "$env:ProgramFiles\LLVM\bin\llvm-readobj.exe" --coff-imports "$env:ProgramFiles\LLVM\bin\liblldb.dll" | Select-String 'python'
-          & "$env:ProgramFiles\LLVM\bin\lldb.exe" --version; "lldb exit code: $LASTEXITCODE"
+          $bin = "$env:ProgramFiles\LLVM\bin"
+          foreach ($f in @('lldb.exe', 'liblldb.dll')) {
+            "--- DLLs imported by $f"
+            & "$bin\llvm-readobj.exe" --coff-imports "$bin\$f" | ForEach-Object { if ($_ -match 'Name: (.+)$') { "  " + $Matches[1] } }
+          }
+          & "$bin\lldb.exe" --version; "lldb exit code: $LASTEXITCODE"
+          exit 0
 
       # Same entry points a user runs. cmd -> Windows PowerShell 5.1.
       - name: setup.cmd
