@@ -55,6 +55,11 @@ $results['phase7-standalone-mm'] = Test-LabVm "$PSScriptRoot\phase7-standalone-m
     '(written by MM)') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin-standalone" `
     -ExtraArgs @('-global', 'mch.extended-tseg-mbytes=32')
 
+Write-Host "`n== Phase 8: debugging the SMM handler with LLDB ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase8-smm-gdb\build.ps1"
+& "$PSScriptRoot\phase8-smm-gdb\debug.ps1" -Demo
+$results['phase8-smm-gdb'] = ($LASTEXITCODE -eq 0)
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.

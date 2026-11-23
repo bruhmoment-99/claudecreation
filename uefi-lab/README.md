@@ -16,6 +16,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 5 | Our own bootloader + our own kernel: page tables, interrupts, framebuffer, a shell | [`phase5-kernel/`](phase5-kernel) |
 | 6 | Ring -2 guards the flash: only SMM may write firmware storage, and our handler owns a variable ring 0 can't change | [`phase6-smm-flash/`](phase6-smm-flash) |
 | 7 | The same handler in **Standalone MM**, the newer, isolated ring -2 architecture, compared with Traditional MM | [`phase7-standalone-mm/`](phase7-standalone-mm) |
+| 8 | Debugging ring -2: breakpoints, source stepping and memory reads **inside SMM** with LLDB/GDB | [`phase8-smm-gdb/`](phase8-smm-gdb) |
 
 ## Quick start (Windows 11)
 
@@ -24,7 +25,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2 to 7 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds phases 2 to 8 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -56,6 +57,7 @@ uefi-lab\
   phase5-kernel\               loader\ (bootloader), kernel\ (our kernel), include\boot.h, run.cmd
   phase6-smm-flash\            app\flashguard.c (uses phase4-smm's firmware), run.cmd
   phase7-standalone-mm\        app\mmcompare.c (runs on both firmware builds), run.cmd
+  phase8-smm-gdb\              app\smmdebug.c, debug.cmd (LLDB), debug.sh (GDB/LLDB)
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -472,6 +474,62 @@ ring 3 app can't prevent that by itself. Standalone MM is one of the
 platform-level answers: MM's access to non-MMRAM memory is limited to what
 was described to it at boot. Others are SMM supervisors and Windows' SMM
 protections on Secured-core PCs, and memory encryption for VMs (SEV-SNP, TDX).
+
+## Phase 8 — debugging ring -2
+
+```bat
+phase8-smm-gdb\debug.cmd                 :: Traditional MM, interactive (lldb) prompt
+phase8-smm-gdb\debug.cmd -Standalone     :: same, on the Standalone MM firmware
+phase8-smm-gdb\debug.cmd -Demo           :: scripted tour with PASS/FAIL checks
+```
+On Linux, `./debug.sh` uses GDB (`--lldb` for LLDB, `--standalone`, `--demo`).
+
+QEMU has a built-in GDB server. The debugger attaches to the **emulated
+CPU**, so it can stop it anywhere, even in SMM, where no OS debugger can
+reach. LLDB comes with the LLVM you already installed. How it fits together:
+
+1. QEMU starts with `-gdb tcp:127.0.0.1:1234`.
+2. The app (`app/smmdebug.c`) asks the handler where it lives and prints
+   `DEBUG-HANDLER-ADDRESS=0x...`. Then it waits 15 seconds before sending one
+   `PING` with the marker `Arg = 0x1234ABCD`.
+3. The script subtracts `LabGuidHandler`'s offset in the symbol file from that
+   address, which gives where the driver was loaded. It then loads the DWARF
+   symbols there. The symbols are `phase4-smm\firmware\bin*\symbols\*.debug`,
+   saved by `build-firmware.sh` with each firmware build.
+4. It breaks on `LabGuidHandler` and continues. The next SMI stops the CPU
+   **inside SMM**, at `LabSmmHandler.c:224`, with source.
+
+What the demo shows (real LLDB output, Standalone MM):
+```
+(lldb) memory read --size 1 --format x --count 8 0x000000000EFF132B      <- CPU in ring 0
+0x0eff132b: 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff
+(lldb) process continue
+* thread #1, stop reason = breakpoint 1.1
+    frame #0: LabMmHandlerStandalone.debug`LabGuidHandler(..., CommBuffer=0x000000000f0a0018, ...)
+              at LabSmmHandler.c:224:1
+(lldb) memory read --size 1 --format x --count 8 0x000000000EFF132B      <- CPU in SMM
+0x0eff132b: 0xf3 0x0f 0x1e 0xfa 0x55 0x48 0x89 0xe5
+(lldb) expression -f x -- ((LAB_SMM_MSG *)CommBuffer)->Arg
+(UINT64) $0 = 0x000000001234abcd
+* thread #1, stop reason = breakpoint 2.1
+    frame #0: LabMmHandlerStandalone.debug`ProcessMessage(Msg=0x000000000f153b08) at LabSmmHandler.c:156:1
+```
+- **The same address reads differently depending on the CPU's mode.** The
+  debugger sees memory the way the CPU currently does. Outside SMM, SMRAM
+  reads as `FF`. Stopped inside SMM, the real code is there.
+- **`CommBuffer` shows the Phase 7 difference directly.** On Standalone MM it
+  points inside MMRAM (`0x0f0a0018`, the core's copy). On Traditional MM it
+  points into ring 0 memory (for example `0x0ddaf018`).
+- **`Msg` in `ProcessMessage`** points into SMRAM: it's the handler's private
+  copy, `Local`, which is rule 2 from Phase 4.
+
+Interactive commands to try once it stops: `bt`, `register read rip cs`,
+`frame variable`, `memory read $pc`, `thread step-over`, `process continue`.
+In GDB: `bt`, `info registers`, `x/16xb $pc`, `next`, `continue`.
+
+Note: the firmware is a RELEASE build (optimized, with LTO), so some
+variables show as `<optimized out>` and stepping can jump around. For
+smoother stepping, build with `TARGET=DEBUG` in `build-firmware.sh`.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs

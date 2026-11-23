@@ -77,4 +77,8 @@ build -a X64 -t GCC -b "$TARGET" -n "$(nproc)" -p OvmfPkg/OvmfPkgX64.dsc \
 OUT="$EDK2/Build/OvmfX64/${TARGET}_GCC/FV"
 mkdir -p "$OUTDIR"
 cp "$OUT/OVMF_CODE.fd" "$OUT/OVMF_VARS.fd" "$OUTDIR/"
+# Debug symbols for our handler (DWARF), used by phase8-smm-gdb.
+MOD=LabSmmHandler; [[ $MM_MODEL == standalone ]] && MOD=LabMmHandlerStandalone
+mkdir -p "$OUTDIR/symbols"
+cp "$EDK2/Build/OvmfX64/${TARGET}_GCC/X64/LabSmmPkg/LabSmmHandler/$MOD/DEBUG/$MOD.debug" "$OUTDIR/symbols/"
 echo "firmware ready ($MM_MODEL MM): $OUTDIR/OVMF_CODE.fd, OVMF_VARS.fd"
