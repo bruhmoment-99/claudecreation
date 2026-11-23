@@ -13,6 +13,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 2 | First UEFI app → `BOOTX64.EFI` | [`phase2-hello/`](phase2-hello) |
 | 3 | UEFI driver + protocols, boot vs. runtime services, OS handoff | [`phase3-driver/`](phase3-driver) |
 | 4 | Ring -2: our own SMI handler in SMRAM, in our own firmware build | [`phase4-smm/`](phase4-smm) |
+| 5 | Our own bootloader + our own kernel: page tables, interrupts, framebuffer, a shell | [`phase5-kernel/`](phase5-kernel) |
 
 ## Quick start (Windows 11)
 
@@ -21,7 +22,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2, 3 and 4 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds phases 2 to 5 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -36,7 +37,7 @@ needed).
 ### What setup installs
 | Tool | winget id | Default location |
 |---|---|---|
-| LLVM (clang + lld-link) | `LLVM.LLVM` | `C:\Program Files\LLVM\bin` |
+| LLVM (clang, lld-link, ld.lld) | `LLVM.LLVM` | `C:\Program Files\LLVM\bin` |
 | QEMU (+ OVMF in `share\edk2-x86_64-code.fd`) | `SoftwareFreedomConservancy.QEMU` | `C:\Program Files\qemu` |
 
 The scripts find these even if the installers didn't add them to `PATH`. If
@@ -49,6 +50,8 @@ uefi-lab\
   tools\common.ps1             shared helpers: find tools, build .efi, start QEMU
   phase2-hello\                main.c, efi.h, build.cmd, run.cmd
   phase3-driver\               loader.c, driver.c, lab_protocol.h, build.cmd, run.cmd
+  phase4-smm\                  LabSmmPkg\ (SMM driver), firmware\bin\ (prebuilt OVMF), app\, run.cmd
+  phase5-kernel\               loader\ (bootloader), kernel\ (our kernel), include\boot.h, run.cmd
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -267,6 +270,75 @@ Studio Build Tools, NASM, IASL and Python, plus `edksetup.bat` and the
 `VS2022` toolchain. Not needed for this lab, since the build output is
 committed.
 
+## Phase 5 — your own bootloader and kernel
+
+```bat
+phase5-kernel\run.cmd
+```
+Click into the QEMU window, type `help` and press Enter.
+
+![The kernel's shell](phase5-kernel/docs/shell.png)
+
+Two programs you wrote now boot the machine, with **no OS involved at all**:
+
+| Part | Format | Role |
+|---|---|---|
+| `loader/loader.c` → `BOOTX64.EFI` | PE (UEFI app) | The bootloader. Reads `\kernel.elf`, puts its segments at the physical addresses they were linked for, collects the framebuffer, memory map and ACPI pointer into a `BOOT_INFO`, calls `ExitBootServices` and jumps. |
+| `include/boot.h` | shared | `BOOT_INFO`, the handoff contract. Linux's `boot_params` and Windows' loader block do the same job. |
+| `kernel/*.c` → `kernel.elf` | ELF, linked at 4 MiB | The kernel. No UEFI, no libc. |
+
+What the kernel does, in order (see `kmain` in `kernel/kernel.c`):
+1. **Switches to its own stack.** The firmware's stack is in memory the map
+   now calls free.
+2. **Loads its own GDT and page tables** (`kernel/cpu.c`). Same reason: the
+   firmware's copies live in `EfiBootServicesData`. The page tables
+   identity-map 4 GiB with 2 MiB pages and keep the device window (3–4 GiB)
+   uncached.
+3. **Installs an IDT** with all 32 CPU exception handlers, then fires `int3`
+   to prove it works (the handler runs and returns).
+4. **Reads the memory map** and hands out pages from the largest free region
+   (a bump allocator, the simplest kind).
+5. **Starts interrupts:** it remaps the 8259 PIC, puts the local APIC in
+   virtual-wire mode, runs the PIT timer at 100 Hz and turns on the PS/2
+   keyboard IRQ.
+6. **Runs a shell on the framebuffer.** It draws with its own hand-made 5×7
+   font (`kernel/font.h`; edit the pixels to change the font).
+
+Shell commands:
+
+| Command | What it shows |
+|---|---|
+| `mem` | the memory map the bootloader passed over |
+| `uptime` | timer interrupts counted so far |
+| `alloc` | a fresh page from the allocator |
+| `int3` | a breakpoint exception that the kernel survives |
+| `crash` | a real divide-by-zero, which brings up the kernel panic screen below |
+| `off` | power off by calling UEFI **runtime** services, which still exist after `ExitBootServices` |
+
+![Kernel panic after `crash`](phase5-kernel/docs/panic.png)
+
+### Things worth noticing in the code
+- **Two ABIs meet at the jump.** The bootloader is compiled for the
+  Microsoft x64 ABI (UEFI's), and the kernel for System V (ELF's). The
+  loader calls the kernel through a `sysv_abi` function pointer. The kernel
+  calls UEFI's `ResetSystem` through an `ms_abi` one.
+- **Interrupt handlers in C:** `__attribute__((interrupt))` makes clang save
+  registers and return with `IRETQ`. That's why the kernel is built with
+  `-mgeneral-regs-only`: there's no SSE state to save.
+- **Why `crash` is written in assembly:** in C, clang turns `1 / x` into a
+  comparison and never divides, so no fault would happen.
+- **Linking:** the kernel is linked with `ld.lld` and `kernel/linker.ld` at
+  `0x400000`. The loader asks UEFI for exactly those pages
+  (`AllocatePages(AllocateAddress)`), so the address must be free RAM.
+
+### Ideas to try
+- Give the console a scrollback buffer, or add Shift so the keyboard can type
+  symbols.
+- Replace the bump allocator with a bitmap allocator that can free pages.
+- Use the local APIC timer instead of the PIT, then find the I/O APIC
+  through the ACPI tables (`acpi_rsdp` is already in `BOOT_INFO`).
+- Add a ring 3 "user program": a TSS, user segments, and a `syscall` entry point.
+
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs
 `clang lld qemu-system-x86 ovmf`). Phase 4's firmware build is Linux-only.
@@ -275,4 +347,4 @@ Every phase has `build.sh` and `run.sh` that do the same thing (needs
 Every push runs `.github/workflows/windows-selftest.yml` on a GitHub-hosted
 Windows Server 2025 runner. It installs QEMU, runs `setup.cmd` and
 `selftest.cmd` through Windows PowerShell 5.1 exactly as you would, and
-uploads each phase's `serial.log` as an artifact. All three phases pass there.
+uploads each phase's `serial.log` as an artifact. All phases pass there.

@@ -1,0 +1,4 @@
+esp/
+obj/
+ovmf_vars.fd
+serial.log

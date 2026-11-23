@@ -19,6 +19,14 @@ function Get-Clang {
     Find-Exe 'clang.exe' @("$env:ProgramFiles\LLVM\bin\clang.exe",
                            "${env:ProgramFiles(x86)}\LLVM\bin\clang.exe")
 }
+# ld.lld links the Phase 5 kernel (an ELF file). It ships with LLVM, next to clang.
+function Get-LdLld {
+    $clang = Get-Clang
+    if (-not $clang) { return $null }
+    $ld = Join-Path (Split-Path $clang) 'ld.lld.exe'
+    if (Test-Path $ld) { return $ld }
+    Find-Exe 'ld.lld.exe' @()
+}
 function Get-Qemu {
     Find-Exe 'qemu-system-x86_64.exe' @("$env:ProgramFiles\qemu\qemu-system-x86_64.exe")
 }
@@ -110,11 +118,11 @@ function Start-LabVm([string]$Dir, [string]$FirmwareDir, [switch]$Headless) {
 
 # Unattended run: no window, firmware console captured to serial.log, then
 # check that the log contains every expected line. Returns $true or $false.
-function Test-LabVm([string]$Dir, [string[]]$Expect, [int]$TimeoutSec = 120, [string]$FirmwareDir) {
+function Test-LabVm([string]$Dir, [string[]]$Expect, [int]$TimeoutSec = 120, [string]$FirmwareDir, [string[]]$ExtraArgs = @()) {
     Assert-Emulator
     $log = Join-Path $Dir 'serial.log'
     if (Test-Path $log) { Remove-Item $log }
-    $qemuArgs = (Get-QemuArgs $Dir $FirmwareDir) + @('-display', 'none', '-serial', 'file:serial.log')
+    $qemuArgs = (Get-QemuArgs $Dir $FirmwareDir) + @('-display', 'none', '-serial', 'file:serial.log') + $ExtraArgs
     $argLine = ($qemuArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $p = Start-Process -FilePath (Get-Qemu) -ArgumentList $argLine -WorkingDirectory $Dir `
                        -PassThru -NoNewWindow

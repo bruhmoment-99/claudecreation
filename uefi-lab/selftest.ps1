@@ -33,6 +33,19 @@ $results['phase4-smm'] = Test-LabVm "$PSScriptRoot\phase4-smm" @(
     '[SMM] ring -2 here: software SMI 0x5A',
     'SMM answered') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin"
 
+Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase5-kernel\build.ps1"
+# isa-debug-exit lets the kernel end the VM after its 3-second boot check.
+$results['phase5-kernel'] = Test-LabVm "$PSScriptRoot\phase5-kernel" @(
+    'ExitBootServices and jumping to the kernel',
+    '[kernel] hello from our own kernel',
+    '[kernel] page tables loaded',
+    'drawing works',
+    'exception 3 (BREAKPOINT)',
+    '[kernel] interrupts on',
+    '[kernel] uptime 3 s',
+    '[kernel] boot checks complete') -ExtraArgs @('-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04')
+
 Write-Host "`n== Summary ==" -ForegroundColor Cyan
 $allOk = $true
 foreach ($k in $results.Keys) {
