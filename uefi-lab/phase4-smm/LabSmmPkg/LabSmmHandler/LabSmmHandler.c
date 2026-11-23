@@ -49,6 +49,7 @@ STATIC UINT64               mSmramBase;
 STATIC UINT64               mSmramSize;
 STATIC UINT64               mMailbox;        /* physical address registered via SET_MAILBOX, 0 = none */
 STATIC UINT64               mTotalSmis;      /* every SMI, counted by the root handler */
+STATIC UINT64               mMailboxSmis;    /* software SMIs 0x5A served through the mailbox */
 STATIC EFI_SMM_VARIABLE_PROTOCOL  *mSmmVariable;
 
 #define COUNTER_ATTRIBUTES  (EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS)
@@ -365,6 +366,18 @@ LabRootHandler (
   CopyMem (&Local, (VOID *)(UINTN)mMailbox, sizeof (Local));
   ProcessMessage (&Local);
   CopyMem ((VOID *)(UINTN)mMailbox, &Local, sizeof (Local));
+
+  /* Report the first few, then every 100th, so a stress test (Phase 11)
+     doesn't flood the serial port. */
+  mMailboxSmis++;
+  if ((mMailboxSmis > 3) && ((mMailboxSmis % 100) != 0)) {
+    if (mMailboxSmis == 4) {
+      SerialPuts (ModelTag ());
+      SerialPuts (" (more mailbox SMIs: reporting every 100th from now on)\n");
+    }
+
+    return EFI_WARN_INTERRUPT_SOURCE_QUIESCED;
+  }
 
   SerialPuts (ModelTag ());
   SerialPuts (" ring -2 here: software SMI 0x5A on CPU ");

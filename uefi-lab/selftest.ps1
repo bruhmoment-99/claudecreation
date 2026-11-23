@@ -93,6 +93,17 @@ $a = Test-LabVm $p10 @('SetupMode = 1', 'untrusted.efi: ALLOWED', 'write PK : EF
 $b = Test-LabVm $p10 @("The firmware checked THIS app's hash against db", '-> Secure Boot works') -FirmwareDir $fw10
 $results['phase10-secure-boot'] = $a -and $b
 
+Write-Host "`n== Phase 11: stress-testing the SMM handler ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase11-smm-stress\build.ps1"
+$p11 = "$PSScriptRoot\phase11-smm-stress"
+$tseg = @('-global', 'mch.extended-tseg-mbytes=32')
+$a = Test-LabVm $p11 @('Traditional MM, seed', 'violations                          : 0', 'handler code after the storm        : unchanged',
+    'machine still alive after the raw SMI storm', 'Summary: 3400 hostile inputs, 0 violations, handler code unchanged -> PASS') `
+    -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin" -ExtraArgs $tseg -FreshVars -TimeoutSec 240
+$b = Test-LabVm $p11 @('Standalone MM, seed', 'Summary: 3400 hostile inputs, 0 violations, handler code unchanged -> PASS') `
+    -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin-standalone" -ExtraArgs $tseg -FreshVars -TimeoutSec 240
+$results['phase11-smm-stress'] = $a -and $b
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.

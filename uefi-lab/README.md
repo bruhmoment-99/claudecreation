@@ -19,6 +19,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 8 | Debugging ring -2: breakpoints, source stepping and memory reads **inside SMM** with LLDB/GDB | [`phase8-smm-gdb/`](phase8-smm-gdb) |
 | 9 | How SMM protects **itself**: read-only code, no-execute data, no jumping into OS memory | [`phase9-smm-selfprotect/`](phase9-smm-selfprotect) |
 | 10 | **Secure Boot**: enroll your own keys, watch the firmware refuse unknown and tampered programs | [`phase10-secure-boot/`](phase10-secure-boot) |
+| 11 | **Stress test**: thousands of hostile messages and raw SMIs thrown at the handler | [`phase11-smm-stress/`](phase11-smm-stress) |
 
 ## Quick start (Windows 11)
 
@@ -63,6 +64,7 @@ uefi-lab\
   phase8-smm-gdb\              app\smmdebug.c, debug.cmd (LLDB), debug.sh (GDB/LLDB)
   phase9-smm-selfprotect\      app\smmguard.c, run.cmd (-Standalone)
   phase10-secure-boot\         app\secureboot.c (+ trusted.c, untrusted.c), keys\, run.cmd (-Reset)
+  phase11-smm-stress\          app\smmstress.c, run.cmd (-Standalone)
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -656,6 +658,51 @@ flash file is separate, so other phases aren't affected. The firmware image
 (`phase4-smm\firmware\bin`) is built with `SECURE_BOOT_ENABLE=TRUE`. With an
 empty flash it stays in setup mode, which is why phases 4, 6, 8 and 9 behave
 exactly as before.
+
+## Phase 11 — stress-testing the handler
+
+```bat
+phase11-smm-stress\run.cmd -Headless
+phase11-smm-stress\run.cmd -Headless -Standalone
+```
+
+Every byte an SMI handler receives is controlled by ring 0, so firmware
+vendors throw huge amounts of malformed input at their handlers. This app
+does the same to `LabSmmHandler`, with a fixed random seed so every run is
+identical and any failure can be reproduced:
+
+- **Part A, 3000 messages through MM Communicate:** random commands and
+  arguments, `SET_MAILBOX` with hostile pointers (inside SMRAM, the last
+  SMRAM page, straddling SMRAM, unaligned, NULL, the top of the address
+  space), `PAGE_INFO` on random addresses, wrong message lengths, a wrong
+  GUID, and messages that are pure garbage.
+- **Part B, 400 raw SMIs after `ExitBootServices`:** random SMI command
+  bytes on port 0xB2, which the handler must ignore, plus garbage in the
+  mailbox (Traditional MM only, since Standalone refuses ordinary-RAM
+  mailboxes).
+
+It checks the rules from Phases 4–7 under pressure. Real output (identical
+on both models, apart from Part B):
+```
+[A] Communicate path: 3000 messages
+    answered          : 2026
+      of which REJECTED (bad pointer)   : 560
+      of which BAD_COMMAND (unknown cmd): 763
+    ignored by the handler (wrong size) : 489
+    no handler for that GUID            : 485
+    violations                          : 0
+    handler code after the storm        : unchanged
+[B] raw SMIs sent: 400, mailbox requests answered: 200
+[B] machine still alive after the raw SMI storm
+Summary: 3400 hostile inputs, 0 violations, handler code unchanged -> PASS
+```
+A **violation** is any of: a hostile pointer accepted, a wrong-size message
+processed, a wrong-GUID message answered, the handler stopping answering
+(checked every 250 messages), or its code bytes changing. Two commands are
+left out on purpose: `TRY_WRITE_CODE`, which halts the machine by design
+(Phase 9), and `INCREMENT_COUNTER`, which would write flash thousands of
+times (Phase 6). Change `SEED` or `ITERATIONS` in `app/smmstress.c` to explore
+further.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs
