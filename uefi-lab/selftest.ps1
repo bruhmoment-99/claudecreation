@@ -21,6 +21,18 @@ $results['phase3-driver'] = Test-LabVm "$PSScriptRoot\phase3-driver" @(
     'ExitBootServices succeeded',
     'RuntimeServices->GetTime()')
 
+Write-Host "`n== Phase 4: ring -2 (SMM) on our own firmware ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase4-smm\build.ps1"
+$results['phase4-smm'] = Test-LabVm "$PSScriptRoot\phase4-smm" @(
+    '[SMM] LabSmmHandler loaded into SMRAM',
+    'LockState = locked',
+    'accepted by SMM',
+    'FF FF FF FF FF FF FF FF',
+    'real x86 machine code',
+    'status REJECTED',
+    '[SMM] ring -2 here: software SMI 0x5A',
+    'SMM answered') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin"
+
 Write-Host "`n== Summary ==" -ForegroundColor Cyan
 $allOk = $true
 foreach ($k in $results.Keys) {

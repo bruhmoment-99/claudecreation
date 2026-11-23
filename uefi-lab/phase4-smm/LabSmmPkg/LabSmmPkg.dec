@@ -1,0 +1,16 @@
+## @file
+#  LabSmmPkg - Phase 4 of the UEFI lab: our own code running in SMM (ring -2).
+##
+[Defines]
+  DEC_SPECIFICATION = 0x00010005
+  PACKAGE_NAME      = LabSmmPkg
+  PACKAGE_GUID      = 8554d7e6-e68c-44a0-bd59-db0435305346
+  PACKAGE_VERSION   = 0.1
+
+[Includes]
+  Include
+
+[Guids]
+  ## Identifies messages for our SMI handler. Must match LAB_SMM_COMM_GUID in
+  #  Include/Guid/LabSmmComm.h.
+  gLabSmmCommGuid = { 0xee02351b, 0xdd25, 0x41d0, { 0x95, 0x6b, 0x51, 0x6c, 0x41, 0x4d, 0x36, 0x25 } }

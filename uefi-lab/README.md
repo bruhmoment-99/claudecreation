@@ -12,7 +12,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 1 | Toolchain: LLVM/Clang + lld-link, QEMU + OVMF | `setup.cmd` |
 | 2 | First UEFI app → `BOOTX64.EFI` | [`phase2-hello/`](phase2-hello) |
 | 3 | UEFI driver + protocols, boot vs. runtime services, OS handoff | [`phase3-driver/`](phase3-driver) |
-| 4 | Ring -2: an SMI handler in SMRAM (emulator) | next |
+| 4 | Ring -2: our own SMI handler in SMRAM, in our own firmware build | [`phase4-smm/`](phase4-smm) |
 
 ## Quick start (Windows 11)
 
@@ -21,7 +21,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2 and 3 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds phases 2, 3 and 4 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -176,16 +176,100 @@ Real output:
 - Build it as `efi_runtime_driver` with its data in `EfiRuntimeServicesData`,
   then call it after `ExitBootServices`.
 
-## Phase 4 preview
+## Phase 4 — ring -2: your own SMM handler
 
-The QEMU for Windows installer already includes an SMM-enabled OVMF
-(`share\edk2-x86_64-secure-code.fd`, run with `-machine q35,smm=on`). That
-means the first ring -2 experiments can run on Windows without building
-EDK II yourself.
+```bat
+phase4-smm\run.cmd -Headless
+```
+
+**This phase boots our own firmware.** `phase4-smm\firmware\bin\OVMF_CODE.fd`
+is an OVMF image built from EDK II with SMM turned on and **our SMM driver
+built in**. It's prebuilt and in the repo, so on Windows you just run it.
+QEMU starts with `-machine q35,smm=on`, which emulates System Management Mode
+and SMRAM. Your PC's real firmware is never involved.
+
+### Why the driver has to be inside the firmware
+An SMM driver can't be loaded from a disk like phases 2 and 3. During boot,
+the SMM core loads SMM drivers from the **flash firmware volume** into SMRAM,
+and then firmware **locks** SMRAM. After that, nothing outside SMM can get
+code in there, not even the firmware's own DXE drivers or the OS kernel. So
+"writing SMM code" means building your own firmware image. That's what
+`firmware/build-firmware.sh` does:
+1. Clone EDK II at the pinned release `edk2-stable202608`.
+2. Add `LabSmmPkg/LabSmmHandler/LabSmmHandler.inf` to `OvmfPkgX64.dsc`
+   (build it) and `.fdf` (put it in the flash image).
+3. Build with `-D SMM_REQUIRE=TRUE` and copy the `.fd` files to `firmware/bin/`.
+
+### The pieces
+| File | Runs in | Role |
+|---|---|---|
+| `LabSmmPkg/LabSmmHandler/LabSmmHandler.c` | **SMM (ring -2)** | `DXE_SMM_DRIVER`. Registers two SMI handlers with `gSmst->SmiHandlerRegister`. The GUID handler serves `EFI_SMM_COMMUNICATION_PROTOCOL` calls. The root handler runs on every SMI and answers software SMI `0x5A` through a mailbox page. |
+| `LabSmmPkg/Include/Guid/LabSmmComm.h` | both sides | The message format: commands, status codes and the `LAB_SMM_MSG` struct. |
+| `app/smmtest.c` | ring 0 | Boots as `BOOTX64.EFI` and pokes at SMM from outside. |
+
+### What the test app shows (real output)
+```
+[SMM] LabSmmHandler loaded into SMRAM. Handler at 0x...FFB63F0, SMRAM 0x...F009000 + 16348 KiB
+[1] SMRAM, according to EFI_SMM_ACCESS2_PROTOCOL
+    range 0x000000000F009000 size 16348 KiB  state: closed
+    LockState = locked
+[2] Finding a communication buffer SMM will accept
+    comm buffer at 0x000000000EDAF000 (EfiRuntimeServicesData) accepted by SMM
+    our SMM handler code is at 0x000000000FFB63F0 (inside SMRAM ...)
+[3] Ring 0 reads the handler's address directly
+    FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+[4] Asking SMM (ring -2) for the same bytes
+    F3 0F 1E FA 55 48 89 E5 41 54 57 56 53 48 81 EC
+    -> real x86 machine code: SMM sees what ring 0 can't
+[5] Pointer validation (the classic SMM bug class)
+    SET_MAILBOX(0x000000000F009000) - an address INSIDE SMRAM:
+    status REJECTED
+[6] ExitBootServices, then a raw software SMI (out 0xB2, 0x5A)
+[app] ring 0: writing request to mailbox and triggering SMI...
+[SMM] ring -2 here: software SMI 0x5A on CPU 0, request #7, mailbox 0x...EDAE000. Resuming the OS (RSM).
+[app] ring 0 again: SMM answered, request #7, status OK. The OS saw nothing but one OUT instruction.
+```
+- **[3] vs [4]:** the same address reads as all `FF` from ring 0, because the
+  chipset hides SMRAM. From SMM it returns the real start of our handler:
+  `F3 0F 1E FA` is `endbr64`, and `55 48 89 E5` is `push rbp; mov rbp, rsp`.
+- **[2]:** SMM only accepts communication buffers in memory types it recorded
+  as safe when SMRAM was locked (`EfiRuntimeServicesData`, `EfiACPIMemoryNVS`,
+  `EfiReservedMemoryType`). The app tries them in that order.
+- **[6]:** after `ExitBootServices` no UEFI protocols are left. Ring 0 writes
+  a request into the mailbox and executes `out 0xB2, 0x5A`. The CPU drops
+  into SMM, our root handler answers and prints straight to the UART, then
+  `RSM` resumes the "OS". This is how OS-time SMIs work on real machines.
+- The request counter (#1, #2 ... #7) lives in SMRAM and persists across
+  SMIs, out of the OS's reach.
+
+### Security lessons, in the code
+SMM can read and write **all** memory, and everything it receives is
+controlled by the attacker. `LabSmmHandler.c` applies the three classic rules:
+1. **Validate every pointer** with `SmmIsBufferOutsideSmmValid()`. Step [5]
+   shows a mailbox pointer *into* SMRAM being rejected. Without that check,
+   ring 0 could make SMM write into its own memory (a "confused deputy").
+   Many real firmware CVEs are exactly this bug.
+2. **Copy, then parse.** The request is copied into SMRAM before it's read,
+   so another CPU or a DMA device can't change it between the check and the
+   use (TOCTOU).
+3. **Never hand SMRAM contents to ring 0.** `READ_SMRAM` breaks this rule on
+   purpose, but only for 32 bytes of our own code, as a demo. Real firmware
+   must never do it.
+
+### Rebuilding the firmware yourself (optional)
+Only needed if you change `LabSmmHandler.c`. On Linux/WSL:
+```bash
+sudo apt install build-essential nasm acpica-tools uuid-dev python3 git
+./phase4-smm/firmware/build-firmware.sh      # about 5 minutes; output in firmware/bin/
+```
+Building EDK II natively on Windows is possible but heavy: it needs Visual
+Studio Build Tools, NASM, IASL and Python, plus `edksetup.bat` and the
+`VS2022` toolchain. Not needed for this lab, since the build output is
+committed.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs
-`clang lld qemu-system-x86 ovmf`). Every phase was tested that way in a cloud
+`clang lld qemu-system-x86 ovmf`). Phase 4's firmware build is Linux-only. Every phase was tested that way in a cloud
 Linux container. The Windows scripts were written for Windows PowerShell 5.1
 (built into Windows 11) and drive the same compiler flags and QEMU command
 line, but they haven't been run on a Windows machine yet.

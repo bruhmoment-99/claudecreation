@@ -1,0 +1,39 @@
+## @file
+#  LabSmmHandler - a DXE_SMM_DRIVER. The SMM core loads it from the firmware
+#  volume into SMRAM, and from then on its handlers run in System Management
+#  Mode: ring -2, invisible to and untouchable by the OS.
+##
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = LabSmmHandler
+  FILE_GUID                      = 4d625791-9b16-48ee-841d-ba1959275b93
+  MODULE_TYPE                    = DXE_SMM_DRIVER
+  VERSION_STRING                 = 1.0
+  PI_SPECIFICATION_VERSION       = 0x0001000A
+  ENTRY_POINT                    = LabSmmHandlerEntry
+
+[Sources]
+  LabSmmHandler.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  LabSmmPkg/LabSmmPkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  SmmServicesTableLib
+  SmmMemLib
+  BaseMemoryLib
+  IoLib
+  DebugLib
+
+[Guids]
+  gLabSmmCommGuid
+
+[Protocols]
+  gEfiSmmAccess2ProtocolGuid      ## CONSUMES (at entry, to learn the SMRAM ranges)
+
+[Depex]
+  gEfiSmmAccess2ProtocolGuid
