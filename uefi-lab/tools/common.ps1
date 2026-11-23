@@ -27,6 +27,61 @@ function Get-LdLld {
     if (Test-Path $ld) { return $ld }
     Find-Exe 'ld.lld.exe' @()
 }
+# LLDB (Phase 8) ships with LLVM, but on Windows liblldb.dll is linked
+# against ONE specific Python DLL (python3XX.dll). If that DLL isn't on PATH,
+# lldb.exe can't even start. This finds out which one it needs.
+function Get-LldbPythonDll {
+    $bin = Split-Path (Get-Clang)
+    $readobj = Join-Path $bin 'llvm-readobj.exe'
+    $lib = Join-Path $bin 'liblldb.dll'
+    if (-not (Test-Path $readobj) -or -not (Test-Path $lib)) { return $null }
+    $m = & $readobj --coff-imports $lib | Select-String -Pattern 'Name: (python3\d+\.dll)' | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return $null
+}
+
+function Test-LldbRuns([string]$Lldb) {
+    try { $null = & $Lldb --version; return ($LASTEXITCODE -eq 0) } catch { return $false }
+}
+
+# Returns the path to a WORKING lldb.exe, fixing PATH for this session if the
+# Python it needs is installed somewhere standard. Returns $null (and explains
+# why) if it can't be made to work.
+function Get-Lldb([switch]$Quiet) {
+    $clang = Get-Clang
+    if (-not $clang) { return $null }
+    $lldb = Join-Path (Split-Path $clang) 'lldb.exe'
+    if (-not (Test-Path $lldb)) { if (-not $Quiet) { Write-Host "lldb.exe is not in your LLVM install." }; return $null }
+
+    if (Test-LldbRuns $lldb) { return $lldb }
+
+    $dll = Get-LldbPythonDll
+    if (-not $dll) { if (-not $Quiet) { Write-Host "lldb.exe does not start, and no Python dependency was found." }; return $null }
+    $digits = $dll -replace '^python3(\d+)\.dll$', '$1'          # python311.dll -> 11
+    $roots = @("$env:LOCALAPPDATA\Programs\Python\Python3$digits",
+               "$env:ProgramFiles\Python3$digits",
+               "${env:ProgramFiles(x86)}\Python3$digits")
+    $toolcache = "C:\hostedtoolcache\windows\Python"
+    if (Test-Path $toolcache) {
+        $roots += Get-ChildItem $toolcache -Directory -Filter "3.$digits.*" -ErrorAction SilentlyContinue |
+                  ForEach-Object { Join-Path $_.FullName 'x64' }
+    }
+    foreach ($r in $roots) {
+        if ($r -and (Test-Path (Join-Path $r $dll))) {
+            $env:PATH = "$r;$env:PATH"
+            if (Test-LldbRuns $lldb) {
+                if (-not $Quiet) { Write-Host "lldb needs $dll; using the one in $r" }
+                return $lldb
+            }
+        }
+    }
+    if (-not $Quiet) {
+        Write-Host "lldb.exe needs $dll (Python 3.$digits), which isn't installed." -ForegroundColor Yellow
+        Write-Host "Run setup.cmd again, or install it with: winget install Python.Python.3.$digits" -ForegroundColor Yellow
+    }
+    return $null
+}
+
 function Get-Qemu {
     Find-Exe 'qemu-system-x86_64.exe' @("$env:ProgramFiles\qemu\qemu-system-x86_64.exe")
 }

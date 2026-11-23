@@ -19,9 +19,9 @@ $fw = (Resolve-Path $fw).Path
 $symPath = Join-Path $fw "symbols\$sym"
 
 $llvmBin = Split-Path (Get-Clang)
-$lldb = Join-Path $llvmBin 'lldb.exe'
 $nm   = Join-Path $llvmBin 'llvm-nm.exe'
-if (-not (Test-Path $lldb)) { throw "lldb.exe not found in $llvmBin. It ships with LLVM (winget install LLVM.LLVM)." }
+$lldb = Get-Lldb
+if (-not $lldb) { throw "LLDB is not usable yet (see the message above)." }
 
 if (-not (Test-Path "$PSScriptRoot\esp\EFI\BOOT\BOOTX64.EFI")) { & "$PSScriptRoot\build.ps1" }
 

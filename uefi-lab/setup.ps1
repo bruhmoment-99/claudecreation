@@ -30,4 +30,21 @@ $ovmf = Get-Ovmf
 if (-not $ovmf) { throw "QEMU is installed but its OVMF firmware (share\edk2-x86_64-code.fd) is missing." }
 Write-Host "[ok] OVMF firmware: $($ovmf.Code)"
 
+# Phase 8 debugs SMM with LLDB, which needs one specific Python version on Windows.
+if (Get-Lldb -Quiet) {
+    Write-Host "[ok] LLDB debugger works"
+} else {
+    $dll = Get-LldbPythonDll
+    if ($dll -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        $digits = $dll -replace '^python3(\d+)\.dll$', '$1'
+        Write-Host "LLDB needs Python 3.$digits ($dll). Installing it with winget. Accept the UAC prompt..." -ForegroundColor Cyan
+        winget install --id "Python.Python.3.$digits" --exact --accept-package-agreements --accept-source-agreements
+        if (Get-Lldb) { Write-Host "[ok] LLDB debugger works" }
+        else { Write-Host "[warn] LLDB still can't start; only Phase 8 needs it. Open a new terminal and retry." -ForegroundColor Yellow }
+    } else {
+        Write-Host "[warn] LLDB can't start; only Phase 8 needs it." -ForegroundColor Yellow
+        Get-Lldb | Out-Null
+    }
+}
+
 Write-Host "`nToolchain ready. Next, run selftest.cmd to build and boot every phase." -ForegroundColor Green
