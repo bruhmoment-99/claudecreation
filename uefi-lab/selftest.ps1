@@ -60,6 +60,26 @@ Write-Host "`n== Phase 8: debugging the SMM handler with LLDB ==" -ForegroundCol
 & "$PSScriptRoot\phase8-smm-gdb\debug.ps1" -Demo
 $results['phase8-smm-gdb'] = ($LASTEXITCODE -eq 0)
 
+Write-Host "`n== Phase 9: how SMM protects itself ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase9-smm-selfprotect\build.ps1"
+$p9 = "$PSScriptRoot\phase9-smm-selfprotect"
+$tseg = @('-global', 'mch.extended-tseg-mbytes=32')
+$p9marker = "$p9\esp\EFI\lab\write-code-test"
+if (Test-Path $p9marker) { Remove-Item $p9marker }
+$a = Test-LabVm $p9 @('Traditional MM)', 'handler code   : READ-ONLY executable', 'handler data   : writable  NO-EXECUTE',
+    'ring 0 page    : writable  NO-EXECUTE', 'Summary: SMM self-protection ON') `
+    -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin" -ExtraArgs $tseg -FreshVars
+$b = Test-LabVm $p9 @('Standalone MM)', 'handler code   : READ-ONLY executable', 'ring 0 page    : NOT MAPPED',
+    'Summary: SMM self-protection ON') `
+    -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin-standalone" -ExtraArgs $tseg -FreshVars
+# The live test halts the machine on purpose: stop as soon as the fault is reported.
+New-Item -ItemType Directory -Force (Split-Path $p9marker) | Out-Null
+Set-Content -Path $p9marker -Value 'run the live write test'
+$c = Test-LabVm $p9 @('about to write to my own code page', '!!!! X64 Exception Type - 0E(#PF - Page-Fault)', 'W:1 P:1') `
+    -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin" -ExtraArgs $tseg -FreshVars -StopWhenFound -TimeoutSec 120
+Remove-Item $p9marker
+$results['phase9-smm-selfprotect'] = $a -and $b -and $c
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.

@@ -23,9 +23,11 @@ EDK2="${1:-$HERE/edk2}"
 TARGET=${TARGET:-RELEASE}                   # RELEASE or DEBUG (DEBUG logs to QEMU debugcon port 0x402)
 MM_MODEL=${MM_MODEL:-traditional}
 
+# Secure Boot support (Phase 10) is built into the Traditional image. With no
+# keys enrolled it stays in "setup mode" and enforces nothing.
 case "$MM_MODEL" in
-  traditional) STANDALONE=FALSE; OUTDIR="$HERE/bin" ;;
-  standalone)  STANDALONE=TRUE;  OUTDIR="$HERE/bin-standalone" ;;
+  traditional) STANDALONE=FALSE; SECUREBOOT=TRUE;  OUTDIR="$HERE/bin" ;;
+  standalone)  STANDALONE=TRUE;  SECUREBOOT=FALSE; OUTDIR="$HERE/bin-standalone" ;;
   *) echo "MM_MODEL must be traditional or standalone"; exit 1 ;;
 esac
 
@@ -72,7 +74,7 @@ make -s -C BaseTools -j"$(nproc)" >/dev/null   # errors still go to stderr
 
 build -a X64 -t GCC -b "$TARGET" -n "$(nproc)" -p OvmfPkg/OvmfPkgX64.dsc \
       -D SMM_REQUIRE=TRUE -D STANDALONE_MM_ENABLE=$STANDALONE \
-      -D SECURE_BOOT_ENABLE=FALSE -D NETWORK_ENABLE=FALSE
+      -D SECURE_BOOT_ENABLE=$SECUREBOOT -D NETWORK_ENABLE=FALSE
 
 OUT="$EDK2/Build/OvmfX64/${TARGET}_GCC/FV"
 mkdir -p "$OUTDIR"

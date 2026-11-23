@@ -24,6 +24,7 @@
   LabSmmPkg/LabSmmPkg.dec
 
 [LibraryClasses]
+  BaseLib
   StandaloneMmDriverEntryPoint
   HobLib
   MemLib

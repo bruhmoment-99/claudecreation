@@ -27,6 +27,27 @@
 #define LAB_CMD_READ_SMRAM   2  /* return the first 32 bytes of our own handler  */
 #define LAB_CMD_SET_MAILBOX  3  /* Arg = physical address of a 4 KiB mailbox     */
 #define LAB_CMD_INCREMENT_COUNTER 4  /* SMM adds 1 to the LabBootCounter variable  */
+#define LAB_CMD_PAGE_INFO         5  /* Phase 9: SMM reports its own page-table protections.
+                                        Arg = a ring 0 address to check too. Results in Data[0..3]
+                                        (LAB_PAGE_* flags) and Value (LAB_CPU_* flags). */
+#define LAB_CMD_TRY_WRITE_CODE    6  /* Phase 9: SMM writes one byte of its OWN code. With SMM
+                                        memory protection on, this page-faults inside SMM and the
+                                        firmware halts the machine. Never returns in that case. */
+
+/* LAB_CMD_PAGE_INFO: which page each Data[] byte describes */
+#define LAB_PAGE_IDX_CODE    0   /* our handler's code             */
+#define LAB_PAGE_IDX_DATA    1   /* our global variables           */
+#define LAB_PAGE_IDX_STACK   2   /* the SMM stack we're running on */
+#define LAB_PAGE_IDX_ARG     3   /* the ring 0 address in Arg      */
+/* ...and the flags in each byte, as seen in the SMM page tables */
+#define LAB_PAGE_PRESENT     0x01
+#define LAB_PAGE_WRITABLE    0x02
+#define LAB_PAGE_NX          0x04   /* no-execute */
+/* LAB_CMD_PAGE_INFO: CPU protection switches while in SMM, in Value */
+#define LAB_CPU_CR0_WP       0x01   /* read-only pages are enforced even for ring 0/SMM */
+#define LAB_CPU_EFER_NXE     0x02   /* no-execute bits are honoured */
+#define LAB_CPU_CR4_SMEP     0x04
+#define LAB_CPU_CR4_SMAP     0x08
 
 /* LabBootCounter: a UEFI variable stored in flash that ring 0 may READ but
    not write. Only our SMM handler can change it (Phase 6). */

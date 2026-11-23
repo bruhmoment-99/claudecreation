@@ -31,6 +31,7 @@
 
 #include <Protocol/SmmVariable.h>
 #include <Protocol/SmmVarCheck.h>
+#include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/IoLib.h>
 #include <Library/DebugLib.h>
@@ -148,6 +149,82 @@ IncrementCounter (
   return Status;
 }
 
+/* ---- Phase 9: how is SMM protecting ITSELF? ----
+   Walk the page tables the CPU is using RIGHT NOW (inside SMM, CR3 points at
+   SMM's own tables, which live in SMRAM) and report the effective access
+   rights for one address: present, writable, no-execute. A page is writable
+   only if every level allows writes, and no-execute if any level says so. */
+STATIC UINT8
+PageFlags (
+  IN UINT64  Address
+  )
+{
+  UINT64   *Table;
+  UINT64   Entry;
+  INTN     Level;
+  INTN     Levels;
+  BOOLEAN  Writable = TRUE;
+  BOOLEAN  NoExec   = FALSE;
+
+  Levels = ((AsmReadCr4 () & BIT12) != 0) ? 5 : 4;   /* CR4.LA57: 5-level paging */
+  Table  = (UINT64 *)(UINTN)(AsmReadCr3 () & 0x000FFFFFFFFFF000ULL);
+
+  for (Level = Levels; Level >= 1; Level--) {
+    Entry = Table[(Address >> (12 + 9 * (Level - 1))) & 0x1FF];
+    if ((Entry & BIT0) == 0) {
+      return 0;                                         /* not mapped at all */
+    }
+
+    Writable = Writable && ((Entry & BIT1) != 0);
+    NoExec   = NoExec || ((Entry & BIT63) != 0);
+    if ((Level <= 3) && (Level >= 2) && ((Entry & BIT7) != 0)) {
+      break;                                            /* 1 GiB or 2 MiB page */
+    }
+
+    Table = (UINT64 *)(UINTN)(Entry & 0x000FFFFFFFFFF000ULL);
+  }
+
+  return (UINT8)(LAB_PAGE_PRESENT | (Writable ? LAB_PAGE_WRITABLE : 0) | (NoExec ? LAB_PAGE_NX : 0));
+}
+
+STATIC VOID
+ReportPageInfo (
+  IN OUT LAB_SMM_MSG  *Msg
+  )
+{
+  UINT64  Cr4 = AsmReadCr4 ();
+
+  Msg->Data[LAB_PAGE_IDX_CODE]  = PageFlags ((UINT64)(UINTN)LabGuidHandler);
+  Msg->Data[LAB_PAGE_IDX_DATA]  = PageFlags ((UINT64)(UINTN)&mCallCount);
+  Msg->Data[LAB_PAGE_IDX_STACK] = PageFlags ((UINT64)(UINTN)Msg);   /* Msg is on our stack */
+  Msg->Data[LAB_PAGE_IDX_ARG]   = PageFlags (Msg->Arg);
+  Msg->Value                    =
+    (((AsmReadCr0 () & BIT16) != 0) ? LAB_CPU_CR0_WP : 0) |
+    (((AsmReadMsr64 (0xC0000080) & BIT11) != 0) ? LAB_CPU_EFER_NXE : 0) |
+    (((Cr4 & BIT20) != 0) ? LAB_CPU_CR4_SMEP : 0) |
+    (((Cr4 & BIT21) != 0) ? LAB_CPU_CR4_SMAP : 0);
+}
+
+/* The live test: write one byte of our own code (the same value it already
+   has, so nothing would change even if it were allowed). If SMM's code pages
+   are read-only, the CPU raises a page fault INSIDE SMM right here, and the
+   firmware's SMM exception handler prints it and halts the machine. */
+STATIC VOID
+TryWriteOwnCode (
+  VOID
+  )
+{
+  volatile UINT8  *Code = (volatile UINT8 *)(UINTN)LabGuidHandler;
+
+  SerialPuts (ModelTag ());
+  SerialPuts (" about to write to my own code page at ");
+  SerialHex ((UINT64)(UINTN)Code);
+  SerialPuts ("...\n");
+  *Code = *Code;
+  SerialPuts (ModelTag ());
+  SerialPuts (" the write SUCCEEDED: SMM code is writable (no protection)\n");
+}
+
 /* ---- The actual work, on a private SMRAM copy of the request. ---- */
 STATIC VOID
 ProcessMessage (
@@ -202,6 +279,14 @@ ProcessMessage (
 
       break;
     }
+
+    case LAB_CMD_PAGE_INFO:
+      ReportPageInfo (Msg);
+      break;
+
+    case LAB_CMD_TRY_WRITE_CODE:
+      TryWriteOwnCode ();
+      break;
 
     default:
       Msg->Status = LAB_STATUS_BAD_COMMAND;

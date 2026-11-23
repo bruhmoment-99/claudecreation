@@ -23,6 +23,7 @@
   LabSmmPkg/LabSmmPkg.dec
 
 [LibraryClasses]
+  BaseLib
   UefiDriverEntryPoint
   UefiBootServicesTableLib
   SmmServicesTableLib

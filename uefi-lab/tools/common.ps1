@@ -173,18 +173,38 @@ function Start-LabVm([string]$Dir, [string]$FirmwareDir, [switch]$Headless, [str
 
 # Unattended run: no window, firmware console captured to serial.log, then
 # check that the log contains every expected line. Returns $true or $false.
-function Test-LabVm([string]$Dir, [string[]]$Expect, [int]$TimeoutSec = 120, [string]$FirmwareDir, [string[]]$ExtraArgs = @()) {
+# -StopWhenFound ends QEMU as soon as every expected line is in the log (for
+# tests that deliberately halt the machine). -FreshVars starts from a clean
+# copy of the variable store.
+function Test-LabVm([string]$Dir, [string[]]$Expect, [int]$TimeoutSec = 120, [string]$FirmwareDir,
+                    [string[]]$ExtraArgs = @(), [switch]$StopWhenFound, [switch]$FreshVars) {
     Assert-Emulator
     $log = Join-Path $Dir 'serial.log'
     if (Test-Path $log) { Remove-Item $log }
+    if ($FreshVars -and (Test-Path (Join-Path $Dir 'ovmf_vars.fd'))) { Remove-Item (Join-Path $Dir 'ovmf_vars.fd') }
     $qemuArgs = (Get-QemuArgs $Dir $FirmwareDir) + @('-display', 'none', '-serial', 'file:serial.log') + $ExtraArgs
     $argLine = ($qemuArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $p = Start-Process -FilePath (Get-Qemu) -ArgumentList $argLine -WorkingDirectory $Dir `
                        -PassThru -NoNewWindow
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        $p.Kill()
-        Write-Host "  timed out after $TimeoutSec s" -ForegroundColor Yellow
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $exited = $false
+    while ((Get-Date) -lt $deadline) {
+        if ($p.WaitForExit(500)) { $exited = $true; break }
+        if ($StopWhenFound -and (Test-Path $log)) {
+            $now = Get-Content $log -Raw -ErrorAction SilentlyContinue
+            if ($now) {
+                $all = $true
+                foreach ($e in $Expect) { if (-not $now.Contains($e)) { $all = $false; break } }
+                if ($all) { break }
+            }
+        }
     }
+    if (-not $exited -and -not $p.HasExited) {
+        $p.Kill()
+        if (-not $StopWhenFound) { Write-Host "  timed out after $TimeoutSec s" -ForegroundColor Yellow }
+    }
+
     $text = ''
     if (Test-Path $log) { $text = Get-Content $log -Raw }
     $ok = $true

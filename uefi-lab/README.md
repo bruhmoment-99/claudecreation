@@ -17,6 +17,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 6 | Ring -2 guards the flash: only SMM may write firmware storage, and our handler owns a variable ring 0 can't change | [`phase6-smm-flash/`](phase6-smm-flash) |
 | 7 | The same handler in **Standalone MM**, the newer, isolated ring -2 architecture, compared with Traditional MM | [`phase7-standalone-mm/`](phase7-standalone-mm) |
 | 8 | Debugging ring -2: breakpoints, source stepping and memory reads **inside SMM** with LLDB/GDB | [`phase8-smm-gdb/`](phase8-smm-gdb) |
+| 9 | How SMM protects **itself**: read-only code, no-execute data, no jumping into OS memory | [`phase9-smm-selfprotect/`](phase9-smm-selfprotect) |
 
 ## Quick start (Windows 11)
 
@@ -25,7 +26,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2 to 8 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds every phase and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -59,6 +60,7 @@ uefi-lab\
   phase6-smm-flash\            app\flashguard.c (uses phase4-smm's firmware), run.cmd
   phase7-standalone-mm\        app\mmcompare.c (runs on both firmware builds), run.cmd
   phase8-smm-gdb\              app\smmdebug.c, debug.cmd (LLDB), debug.sh (GDB/LLDB)
+  phase9-smm-selfprotect\      app\smmguard.c, run.cmd (-Standalone)
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -537,6 +539,53 @@ In GDB: `bt`, `info registers`, `x/16xb $pc`, `next`, `continue`.
 Note: the firmware is a RELEASE build (optimized, with LTO), so some
 variables show as `<optimized out>` and stepping can jump around. For
 smoother stepping, build with `TARGET=DEBUG` in `build-firmware.sh`.
+
+## Phase 9 — how SMM protects itself
+
+```bat
+phase9-smm-selfprotect\run.cmd -Headless
+phase9-smm-selfprotect\run.cmd -Headless -Standalone
+```
+
+Code in ring -2 can do almost anything, so modern firmware also limits what
+SMM code can do to *itself*. After boot, the firmware's SMM CPU driver sets
+up SMM's own page tables with strict rules. The handler has a new command,
+`LAB_CMD_PAGE_INFO`, that walks those page tables **from inside SMM**:
+it reads CR3, follows the 4 levels and combines the writable and no-execute
+bits. It reports what it finds for its own code, its own data, its stack, and
+a ring 0 page.
+
+Real output:
+```
+                     Traditional MM                     Standalone MM
+handler code   : READ-ONLY executable               READ-ONLY executable
+handler data   : writable  NO-EXECUTE               writable  NO-EXECUTE
+SMM stack      : writable  NO-EXECUTE               writable  NO-EXECUTE
+ring 0 page    : writable  NO-EXECUTE               NOT MAPPED
+CR0.WP on, EFER.NXE on  ->  Summary: SMM self-protection ON
+```
+What each rule stops:
+- **Read-only code:** a bug in an SMM handler can't be turned into "rewrite
+  the SMM code".
+- **No-execute data and stack:** bytes an attacker manages to place in SMM
+  memory can't be run as code.
+- **No-execute ring 0 memory**, or not mapped at all in Standalone MM: SMM can
+  never jump into code the OS controls. This blocks the classic *SMM callout*,
+  where a handler calls a function pointer that ring 0 could change.
+- **CR0.WP:** without it, the CPU ignores read-only pages for privileged code,
+  and the first rule would mean nothing.
+
+**The live test** (press `W`, or create `esp\EFI\lab\write-code-test`): the
+handler is asked to write one byte of its own code (the same value it
+already has). The CPU refuses, and the firmware's SMM exception handler
+reports it and stops the machine:
+```
+[SMM] about to write to my own code page at 0x000000000FFA57BA...
+!!!! X64 Exception Type - 0E(#PF - Page-Fault)  CPU Apic ID - 00000000 !!!!
+ExceptionData - 0000000000000003  I:0 R:0 U:0 W:1 P:1 PK:0 SS:0 SGX:0
+```
+`W:1 P:1` means a **write** to a **present** page that's read-only. Phase 8's
+debugger can stop on that fault too.
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs
