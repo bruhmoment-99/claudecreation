@@ -32,6 +32,10 @@
    not write. Only our SMM handler can change it (Phase 6). */
 #define LAB_SMM_COUNTER_NAME  L"LabBootCounter"   /* vendor GUID = LAB_SMM_COMM_GUID */
 
+/* Which firmware architecture the handler was built for (Phase 7) */
+#define LAB_MM_MODEL_TRADITIONAL  1   /* DXE_SMM_DRIVER, loaded during DXE  */
+#define LAB_MM_MODEL_STANDALONE   2   /* MM_STANDALONE, loaded during PEI   */
+
 /* Status codes written back by the handler */
 #define LAB_STATUS_OK           0
 #define LAB_STATUS_BAD_COMMAND  1
@@ -52,6 +56,7 @@ typedef struct {
   UINT64  HandlerAddress; /* out: where our handler code sits - inside SMRAM */
   UINT64  TotalSmis;      /* out: every SMI SMM has handled so far, ours or not */
   UINT64  Value;          /* out: INCREMENT_COUNTER result */
+  UINT64  MmModel;        /* out: LAB_MM_MODEL_TRADITIONAL or LAB_MM_MODEL_STANDALONE */
   UINT8   Data[32];       /* out: READ_SMRAM result */
 } LAB_SMM_MSG;
 #pragma pack()

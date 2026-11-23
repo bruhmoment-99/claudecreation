@@ -108,9 +108,9 @@ function Get-QemuArgs([string]$Dir, [string]$FirmwareDir) {
 
 # Interactive run. -Headless puts the firmware console in this terminal
 # (quit QEMU with Ctrl+A then X).
-function Start-LabVm([string]$Dir, [string]$FirmwareDir, [switch]$Headless) {
+function Start-LabVm([string]$Dir, [string]$FirmwareDir, [switch]$Headless, [string[]]$ExtraArgs = @()) {
     Assert-Emulator
-    $qemuArgs = Get-QemuArgs $Dir $FirmwareDir
+    $qemuArgs = (Get-QemuArgs $Dir $FirmwareDir) + $ExtraArgs
     if ($Headless) { $qemuArgs += '-nographic' }
     Push-Location $Dir
     try { & (Get-Qemu) @qemuArgs } finally { Pop-Location }

@@ -1,7 +1,7 @@
 ## @file
-#  LabSmmHandler - a DXE_SMM_DRIVER. The SMM core loads it from the firmware
-#  volume into SMRAM, and from then on its handlers run in System Management
-#  Mode: ring -2, invisible to and untouchable by the OS.
+#  LabSmmHandler - TRADITIONAL MM build (DXE_SMM_DRIVER). The SMM core loads
+#  it from the firmware volume into SMRAM during DXE. Phases 4 and 6.
+#  The Standalone MM build of the same code is LabMmHandlerStandalone.inf.
 ##
 [Defines]
   INF_VERSION                    = 0x00010005
@@ -13,7 +13,9 @@
   ENTRY_POINT                    = LabSmmHandlerEntry
 
 [Sources]
+  LabMmCommon.h
   LabSmmHandler.c
+  LabSmmEntryTraditional.c
 
 [Packages]
   MdePkg/MdePkg.dec

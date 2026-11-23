@@ -1,0 +1,44 @@
+## @file
+#  LabMmHandlerStandalone - STANDALONE MM build (MM_STANDALONE) of the same
+#  handler code. Loaded by the Standalone MM core during PEI; no access to
+#  UEFI boot services. Phase 7. Traditional build: LabSmmHandler.inf.
+##
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = LabMmHandlerStandalone
+  FILE_GUID                      = 201508d6-f068-47de-b100-587b709c2e7a
+  MODULE_TYPE                    = MM_STANDALONE
+  VERSION_STRING                 = 1.0
+  PI_SPECIFICATION_VERSION       = 0x00010032
+  ENTRY_POINT                    = LabMmHandlerStandaloneEntry
+
+[Sources]
+  LabMmCommon.h
+  LabSmmHandler.c
+  LabMmEntryStandalone.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  StandaloneMmPkg/StandaloneMmPkg.dec
+  LabSmmPkg/LabSmmPkg.dec
+
+[LibraryClasses]
+  StandaloneMmDriverEntryPoint
+  HobLib
+  MemLib
+  BaseMemoryLib
+  IoLib
+  DebugLib
+
+[Guids]
+  gLabSmmCommGuid
+  gEfiSmmSmramMemoryGuid          ## CONSUMES (HOB describing MMRAM)
+
+[Protocols]
+  gEfiSmmVariableProtocolGuid     ## CONSUMES
+  gEdkiiSmmVarCheckProtocolGuid   ## CONSUMES
+
+[Depex]
+  gEfiSmmVariableProtocolGuid AND
+  gEdkiiSmmVarCheckProtocolGuid

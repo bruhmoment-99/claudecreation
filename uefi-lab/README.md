@@ -15,6 +15,7 @@ real firmware, Secure Boot or BitLocker, and nothing can brick it.
 | 4 | Ring -2: our own SMI handler in SMRAM, in our own firmware build | [`phase4-smm/`](phase4-smm) |
 | 5 | Our own bootloader + our own kernel: page tables, interrupts, framebuffer, a shell | [`phase5-kernel/`](phase5-kernel) |
 | 6 | Ring -2 guards the flash: only SMM may write firmware storage, and our handler owns a variable ring 0 can't change | [`phase6-smm-flash/`](phase6-smm-flash) |
+| 7 | The same handler in **Standalone MM**, the newer, isolated ring -2 architecture, compared with Traditional MM | [`phase7-standalone-mm/`](phase7-standalone-mm) |
 
 ## Quick start (Windows 11)
 
@@ -23,7 +24,7 @@ Open the `uefi-lab` folder in File Explorer or a terminal, then:
 | Step | Run | What it does |
 |---|---|---|
 | 1 | `setup.cmd` | Installs LLVM and QEMU with winget. Each one shows a UAC prompt. QEMU includes the OVMF firmware. |
-| 2 | `selftest.cmd` | Builds phases 2 to 6 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
+| 2 | `selftest.cmd` | Builds phases 2 to 7 and boots each one in QEMU with no window. Prints `PASS`/`FAIL` (takes about a minute). |
 | 3 | `phase2-hello\run.cmd` | Boots phase 2 in a QEMU window. |
 |   | `phase2-hello\run.cmd -Headless` | Same, but the firmware console shows in your terminal. Quit with **Ctrl+A** then **X**. |
 
@@ -54,6 +55,7 @@ uefi-lab\
   phase4-smm\                  LabSmmPkg\ (SMM driver), firmware\bin\ (prebuilt OVMF), app\, run.cmd
   phase5-kernel\               loader\ (bootloader), kernel\ (our kernel), include\boot.h, run.cmd
   phase6-smm-flash\            app\flashguard.c (uses phase4-smm's firmware), run.cmd
+  phase7-standalone-mm\        app\mmcompare.c (runs on both firmware builds), run.cmd
 ```
 Build output goes to each phase's `esp\` folder. QEMU shows that folder to the
 VM as a FAT disk, and OVMF boots `esp\EFI\BOOT\BOOTX64.EFI` from it.
@@ -208,7 +210,8 @@ code in there, not even the firmware's own DXE drivers or the OS kernel. So
 ### The pieces
 | File | Runs in | Role |
 |---|---|---|
-| `LabSmmPkg/LabSmmHandler/LabSmmHandler.c` | **SMM (ring -2)** | `DXE_SMM_DRIVER`. Registers two SMI handlers with `gSmst->SmiHandlerRegister`. The GUID handler serves `EFI_SMM_COMMUNICATION_PROTOCOL` calls. The root handler runs on every SMI and answers software SMI `0x5A` through a mailbox page. |
+| `LabSmmPkg/LabSmmHandler/LabSmmHandler.c` | **SMM (ring -2)** | The handlers, shared by both MM models (Phase 7). Registers two SMI handlers with `MmiHandlerRegister`. The GUID handler serves `EFI_SMM_COMMUNICATION_PROTOCOL` calls. The root handler runs on every SMI and answers software SMI `0x5A` through a mailbox page. |
+| `LabSmmPkg/LabSmmHandler/LabSmmEntryTraditional.c` + `LabSmmHandler.inf` | **SMM** | The `DXE_SMM_DRIVER` entry point and buffer checks for Traditional MM, used in this phase. |
 | `LabSmmPkg/Include/Guid/LabSmmComm.h` | both sides | The message format: commands, status codes and the `LAB_SMM_MSG` struct. |
 | `app/smmtest.c` | ring 0 | Boots as `BOOTX64.EFI` and pokes at SMM from outside. |
 
@@ -265,7 +268,8 @@ controlled by the attacker. `LabSmmHandler.c` applies the three classic rules:
 Only needed if you change `LabSmmHandler.c`. On Linux/WSL:
 ```bash
 sudo apt install build-essential nasm acpica-tools uuid-dev python3 git
-./phase4-smm/firmware/build-firmware.sh      # about 5 minutes; output in firmware/bin/
+./phase4-smm/firmware/build-firmware.sh                        # Traditional MM -> firmware/bin/
+MM_MODEL=standalone ./phase4-smm/firmware/build-firmware.sh    # Standalone MM  -> firmware/bin-standalone/
 ```
 Building EDK II natively on Windows is possible but heavy: it needs Visual
 Studio Build Tools, NASM, IASL and Python, plus `edksetup.bat` and the
@@ -407,6 +411,67 @@ make. Requests that arrive from ring 0 through the communication buffer are
 `VarCheckFromUntrusted`, and `VarCheckLib` refuses those for read-only
 variables. The same mechanism protects real platform settings that only
 firmware may change.
+
+## Phase 7 — Standalone MM: the same handler, isolated
+
+```bat
+phase7-standalone-mm\run.cmd -Headless
+phase7-standalone-mm\run.cmd -Headless -Traditional
+```
+
+Phases 4 and 6 use **Traditional MM**: the SMM core is loaded during DXE,
+and SMM drivers start while UEFI boot services still exist. Modern firmware
+is moving to **Standalone MM**:
+
+| | Traditional MM | Standalone MM |
+|---|---|---|
+| Module type | `DXE_SMM_DRIVER` | `MM_STANDALONE` |
+| MM core loaded by | `PiSmmIpl` during **DXE** | `StandaloneMmIplPei` during **PEI**, before DXE exists |
+| Entry point receives | the full UEFI system table (`gBS` works) | only the MM system table: no boot services at all |
+| Learns where MMRAM is from | a DXE protocol (`EFI_SMM_ACCESS2_PROTOCOL`) | a HOB (hand-off block) copied in at load time |
+| Comm buffer the handler gets | a pointer **into ring 0's memory**, which it must validate and copy itself | the MM core's own **copy inside MMRAM** (`mInternalCommBufferCopy`) |
+| Ordinary RAM it will accept from ring 0 | anything the UEFI memory map marked as runtime/reserved | only the ranges described to MM by resource HOBs at boot |
+
+The code is split so you can see exactly what differs:
+`LabSmmPkg/LabSmmHandler/LabSmmHandler.c` holds all the handlers and is
+shared. `LabSmmEntryTraditional.c` and `LabMmEntryStandalone.c` each supply
+an entry point plus two checks, `LabIsBufferOutsideMmValid` and
+`LabIsCommBufferValid`. The firmware is built twice, into
+`phase4-smm\firmware\bin` and `phase4-smm\firmware\bin-standalone`.
+
+Real output, both firmware builds, same app:
+```
+Traditional:                                         Standalone:
+  model: TRADITIONAL MM (loaded during DXE)            model: STANDALONE MM (loaded during PEI)
+  ring 0 buffer -> handler reads it in place           ring 0 buffer -> fixed shared buffer
+                                                         -> MM core copies it INTO MMRAM -> handler
+  [3] pointer INTO MMRAM:   REJECTED                   [3] pointer INTO MMRAM:   REJECTED
+  [4] ordinary RAM page:    ACCEPTED                   [4] ordinary RAM page:    REJECTED
+  [5] LabBootCounter = 1 (written by MM)               [5] LabBootCounter = 1 (written by MM)
+```
+Step [4] is the point. In Standalone MM, ring 0 can't get MM to touch an
+arbitrary page of its choosing, even outside MMRAM. MM's view of normal
+memory is fixed at boot. Phases 4 and 6 also run unchanged on the Standalone
+build: the flash protection and the counter work the same way. Phase 4's
+mailbox step is now refused, for the same reason as step [4].
+
+### Two things that came up while porting
+- **The MM core copies requests for you.** My first port rejected every
+  request, because the shared handler checked that the comm buffer was
+  *outside* MMRAM. In Standalone MM it's deliberately *inside*: the core has
+  already copied it there. The check moved into the per-model entry files.
+- **Standalone MM needs a bigger TSEG.** Its whole heap lives in TSEG
+  (SMRAM). With QEMU's default 16 MiB, even stock OVMF fails: its variable
+  driver hits *Out of Resources*, then page-faults. Phase 7 runs QEMU with
+  `-global mch.extended-tseg-mbytes=32`. On real boards this is a platform
+  setting chosen by the firmware vendor.
+
+### How this relates to protecting ring 3 memory
+Traditional SMM can, in principle, read any RAM, including any app's. A
+ring 3 app can't prevent that by itself. Standalone MM is one of the
+platform-level answers: MM's access to non-MMRAM memory is limited to what
+was described to it at boot. Others are SMM supervisors and Windows' SMM
+protections on Secured-core PCs, and memory encryption for VMs (SEV-SNP, TDX).
 
 ## Also works on Linux / WSL
 Every phase has `build.sh` and `run.sh` that do the same thing (needs

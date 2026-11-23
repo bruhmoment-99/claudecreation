@@ -1,16 +1,17 @@
 /** @file
-  LabSmmHandler.c - Phase 4: our own code running in System Management Mode.
+  LabSmmHandler.c - our code running in Management Mode (ring -2).
+  Shared by both MM architectures; the entry points live in
+  LabSmmEntryTraditional.c and LabMmEntryStandalone.c.
 
   How code gets to ring -2:
     - This driver is part of the FIRMWARE IMAGE (OVMF_CODE.fd), not a file on
-      a disk. During boot the SMM core loads it into SMRAM, a region the
-      chipset hides from everything that isn't in SMM, and calls our entry
-      point. Then firmware LOCKS SMRAM (SmmReadyToLock). After that nothing,
-      not even the firmware's own DXE code or the OS kernel, can read or
-      change this code.
+      a disk. During boot the MM core loads it into SMRAM (also called MMRAM),
+      a region the chipset hides from everything that isn't in SMM, and calls
+      our entry point. Then firmware LOCKS SMRAM. After that nothing, not even
+      the firmware's own DXE code or the OS kernel, can read or change it.
     - From then on our handlers run whenever an SMI (System Management
       Interrupt) fires. The CPU saves its full state, switches to SMM, runs
-      the SMM core, which calls our handlers, then RSMs (resumes) back to
+      the MM core, which calls our handlers, then RSMs (resumes) back to
       whatever the OS was doing. The OS never sees it happen.
 
   Why SMM code is a classic source of security bugs:
@@ -19,7 +20,7 @@
     ALL memory, so a handler that follows an unchecked pointer can be tricked
     into overwriting SMRAM or the kernel for the attacker (a "confused
     deputy"). The rules applied below:
-      1. Validate every external buffer with SmmIsBufferOutsideSmmValid().
+      1. Validate every external buffer (LabIsBufferOutsideMmValid).
       2. Copy the request into SMRAM before parsing it, so ring 0 (another
          CPU or a DMA device) can't change it between our check and our use
          (TOCTOU, time-of-check to time-of-use).
@@ -28,24 +29,25 @@
          code, to show that the bytes exist. A real handler must never do it.
 **/
 
-#include <PiSmm.h>
-#include <Protocol/SmmAccess2.h>
 #include <Protocol/SmmVariable.h>
 #include <Protocol/SmmVarCheck.h>
-#include <Library/UefiBootServicesTableLib.h>
-#include <Library/SmmServicesTableLib.h>
-#include <Library/SmmMemLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/IoLib.h>
 #include <Library/DebugLib.h>
-#include <Guid/LabSmmComm.h>
+#include "LabMmCommon.h"
+
+extern EFI_GUID  gLabSmmCommGuid;
+extern EFI_GUID  gEfiSmmVariableProtocolGuid;
+extern EFI_GUID  gEdkiiSmmVarCheckProtocolGuid;
 
 /* ---- State. All of it lives in SMRAM, so ring 0 can't see or change it. ---- */
-STATIC UINT64  mCallCount;
-STATIC UINT64  mSmramBase;
-STATIC UINT64  mSmramSize;
-STATIC UINT64  mMailbox;        /* physical address registered via SET_MAILBOX, 0 = none */
-STATIC UINT64  mTotalSmis;      /* every SMI, counted by the root handler */
+STATIC EFI_MM_SYSTEM_TABLE  *mMmst;
+STATIC UINT64               mMmModel;
+STATIC UINT64               mCallCount;
+STATIC UINT64               mSmramBase;
+STATIC UINT64               mSmramSize;
+STATIC UINT64               mMailbox;        /* physical address registered via SET_MAILBOX, 0 = none */
+STATIC UINT64               mTotalSmis;      /* every SMI, counted by the root handler */
 STATIC EFI_SMM_VARIABLE_PROTOCOL  *mSmmVariable;
 
 #define COUNTER_ATTRIBUTES  (EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS)
@@ -103,6 +105,12 @@ SerialDec (UINT64 V)
   SerialPuts (&Buf[I]);
 }
 
+STATIC CONST CHAR8 *
+ModelTag (VOID)
+{
+  return mMmModel == LAB_MM_MODEL_STANDALONE ? "[MM standalone]" : "[SMM]";
+}
+
 /* ---- Phase 6: the SMM-only counter in flash ----
    Ring 0's SetVariable() also ends up in SMM (the variable driver lives
    there), but it arrives as an UNTRUSTED request, and LabBootCounter is
@@ -150,12 +158,13 @@ ProcessMessage (
 
   Msg->Magic          = LAB_SMM_MAGIC;
   Msg->CallCount      = mCallCount;
-  Msg->CpuIndex       = gSmst->CurrentlyExecutingCpu;
-  Msg->CpuCount       = gSmst->NumberOfCpus;
+  Msg->CpuIndex       = mMmst->CurrentlyExecutingCpu;
+  Msg->CpuCount       = mMmst->NumberOfCpus;
   Msg->SmramBase      = mSmramBase;
   Msg->SmramSize      = mSmramSize;
   Msg->HandlerAddress = (UINT64)(UINTN)LabGuidHandler;
   Msg->TotalSmis      = mTotalSmis;
+  Msg->MmModel        = mMmModel;
   Msg->Status         = LAB_STATUS_OK;
 
   switch (Msg->Command) {
@@ -170,9 +179,11 @@ ProcessMessage (
     case LAB_CMD_SET_MAILBOX:
       /* The pointer comes from ring 0. If we accepted an SMRAM address here,
          a later mailbox request would make SMM write its reply INTO SMRAM
-         for the attacker. Validate the whole 4 KiB page. */
+         for the attacker. Validate the whole 4 KiB page. In Standalone MM
+         the check is stricter still: only memory described to MM at boot
+         is accepted (see LabMmEntryStandalone.c). */
       if ((Msg->Arg == 0) || ((Msg->Arg & 0xFFF) != 0) ||
-          !SmmIsBufferOutsideSmmValid ((EFI_PHYSICAL_ADDRESS)Msg->Arg, SIZE_4KB))
+          !LabIsBufferOutsideMmValid ((EFI_PHYSICAL_ADDRESS)Msg->Arg, SIZE_4KB))
       {
         Msg->Status = LAB_STATUS_REJECTED;
       } else {
@@ -199,8 +210,8 @@ ProcessMessage (
 }
 
 /**
-  GUID handler: runs when ring 0 calls EFI_SMM_COMMUNICATION_PROTOCOL with our
-  GUID. CommBuffer points at the payload (the LAB_SMM_MSG) in NORMAL memory.
+  GUID handler: runs when ring 0 calls the MM Communication protocol with
+  our GUID. CommBuffer points at the payload (the LAB_SMM_MSG) outside SMRAM.
 **/
 EFI_STATUS
 EFIAPI
@@ -217,10 +228,11 @@ LabGuidHandler (
     return EFI_SUCCESS;
   }
 
-  /* Rule 1: the buffer must be fully outside SMRAM and in memory that is
-     allowed for communication. Rule 2: copy it in before reading it. */
+  /* Rule 1: validate the buffer (how depends on the MM model: see
+     LabIsCommBufferValid in the two entry files). Rule 2: copy it in
+     before reading it. */
   if ((*CommBufferSize != sizeof (LAB_SMM_MSG)) ||
-      !SmmIsBufferOutsideSmmValid ((EFI_PHYSICAL_ADDRESS)(UINTN)CommBuffer, sizeof (LAB_SMM_MSG)))
+      !LabIsCommBufferValid (CommBuffer, sizeof (LAB_SMM_MSG)))
   {
     DEBUG ((DEBUG_ERROR, "LabSmm: rejected comm buffer %p size %lu\n", CommBuffer, (UINT64)*CommBufferSize));
     return EFI_SUCCESS;
@@ -233,7 +245,7 @@ LabGuidHandler (
 }
 
 /**
-  Root handler: the SMM core calls this on EVERY SMI, whatever caused it.
+  Root handler: the MM core calls this on EVERY SMI, whatever caused it.
   We only act when ring 0 wrote our value to APM_CNT (port 0xB2). This path
   needs no UEFI protocol at all, so it keeps working after ExitBootServices,
   the same way an OS-time SMI does on real hardware.
@@ -249,7 +261,7 @@ LabRootHandler (
 {
   LAB_SMM_MSG  Local;
 
-  mTotalSmis++;   /* the SMM core calls root handlers on every SMI */
+  mTotalSmis++;   /* the MM core calls root handlers on every SMI */
 
   if (IoRead8 (LAB_SMM_APM_CNT_PORT) != LAB_SMM_SW_SMI_VALUE) {
     return EFI_WARN_INTERRUPT_SOURCE_PENDING;     /* not ours */
@@ -259,7 +271,8 @@ LabRootHandler (
   IoWrite8 (LAB_SMM_APM_CNT_PORT, 0);
 
   if (mMailbox == 0) {
-    SerialPuts ("[SMM] software SMI 0x5A, but no mailbox registered - ignoring\n");
+    SerialPuts (ModelTag ());
+    SerialPuts (" software SMI 0x5A, but no mailbox registered - ignoring\n");
     return EFI_WARN_INTERRUPT_SOURCE_QUIESCED;
   }
 
@@ -268,7 +281,8 @@ LabRootHandler (
   ProcessMessage (&Local);
   CopyMem ((VOID *)(UINTN)mMailbox, &Local, sizeof (Local));
 
-  SerialPuts ("[SMM] ring -2 here: software SMI 0x5A on CPU ");
+  SerialPuts (ModelTag ());
+  SerialPuts (" ring -2 here: software SMI 0x5A on CPU ");
   SerialDec (Local.CpuIndex);
   SerialPuts (", request #");
   SerialDec (Local.CallCount);
@@ -279,73 +293,60 @@ LabRootHandler (
 }
 
 /**
-  Entry point. Runs ONCE, inside SMRAM, during boot (DXE phase), before
-  SMRAM is locked. Boot services still exist at this point.
+  Shared initialisation, called once from either entry point while MM is
+  still being set up (before SMRAM is locked).
 **/
 EFI_STATUS
-EFIAPI
-LabSmmHandlerEntry (
-  IN EFI_HANDLE        ImageHandle,
-  IN EFI_SYSTEM_TABLE  *SystemTable
+LabMmCommonInit (
+  IN EFI_MM_SYSTEM_TABLE  *Mmst,
+  IN UINT64               MmModel,
+  IN UINT64               MmramBase,
+  IN UINT64               MmramSize
   )
 {
-  EFI_STATUS                Status;
-  EFI_SMM_ACCESS2_PROTOCOL  *Access;
-  EFI_SMRAM_DESCRIPTOR      Ranges[8];
-  UINTN                     Size;
-  UINTN                     Index;
-  EFI_HANDLE                Handle;
+  EFI_STATUS                    Status;
+  EFI_HANDLE                    Handle;
+  EDKII_SMM_VAR_CHECK_PROTOCOL  *VarCheck;
+  VAR_CHECK_VARIABLE_PROPERTY   Property;
 
-  /* Learn the SMRAM ranges (for reporting). Pick the largest one: TSEG. */
-  Status = gBS->LocateProtocol (&gEfiSmmAccess2ProtocolGuid, NULL, (VOID **)&Access);
-  if (!EFI_ERROR (Status)) {
-    Size   = sizeof (Ranges);
-    Status = Access->GetCapabilities (Access, &Size, Ranges);
-    if (!EFI_ERROR (Status)) {
-      for (Index = 0; Index < Size / sizeof (Ranges[0]); Index++) {
-        if (Ranges[Index].PhysicalSize > mSmramSize) {
-          mSmramBase = Ranges[Index].CpuStart;
-          mSmramSize = Ranges[Index].PhysicalSize;
-        }
-      }
-    }
-  }
+  mMmst      = Mmst;
+  mMmModel   = MmModel;
+  mSmramBase = MmramBase;
+  mSmramSize = MmramSize;
 
   /* Phase 6: make LabBootCounter read-only for everyone outside SMM.
      Variable properties can only be set before EndOfDxe; after that the
      list is locked, so ring 0 can't remove this rule later. */
-  {
-    EDKII_SMM_VAR_CHECK_PROTOCOL  *VarCheck;
-    VAR_CHECK_VARIABLE_PROPERTY   Property;
-
-    Status = gSmst->SmmLocateProtocol (&gEfiSmmVariableProtocolGuid, NULL, (VOID **)&mSmmVariable);
-    if (EFI_ERROR (Status)) {
-      mSmmVariable = NULL;
-    }
-
-    Status = gSmst->SmmLocateProtocol (&gEdkiiSmmVarCheckProtocolGuid, NULL, (VOID **)&VarCheck);
-    if (!EFI_ERROR (Status)) {
-      Property.Revision   = VAR_CHECK_VARIABLE_PROPERTY_REVISION;
-      Property.Property   = VAR_CHECK_VARIABLE_PROPERTY_READ_ONLY;
-      Property.Attributes = COUNTER_ATTRIBUTES;
-      Property.MinSize    = sizeof (UINT64);
-      Property.MaxSize    = sizeof (UINT64);
-      Status = VarCheck->SmmVariablePropertySet (LAB_SMM_COUNTER_NAME, &gLabSmmCommGuid, &Property);
-    }
-
-    SerialPuts (EFI_ERROR (Status) ? "[SMM] could not protect LabBootCounter\n"
-                                   : "[SMM] LabBootCounter is now read-only outside SMM\n");
+  Status = mMmst->MmLocateProtocol (&gEfiSmmVariableProtocolGuid, NULL, (VOID **)&mSmmVariable);
+  if (EFI_ERROR (Status)) {
+    mSmmVariable = NULL;
   }
 
+  Status = mMmst->MmLocateProtocol (&gEdkiiSmmVarCheckProtocolGuid, NULL, (VOID **)&VarCheck);
+  if (!EFI_ERROR (Status)) {
+    Property.Revision   = VAR_CHECK_VARIABLE_PROPERTY_REVISION;
+    Property.Property   = VAR_CHECK_VARIABLE_PROPERTY_READ_ONLY;
+    Property.Attributes = COUNTER_ATTRIBUTES;
+    Property.MinSize    = sizeof (UINT64);
+    Property.MaxSize    = sizeof (UINT64);
+    Status              = VarCheck->SmmVariablePropertySet (LAB_SMM_COUNTER_NAME, &gLabSmmCommGuid, &Property);
+  }
+
+  SerialPuts (ModelTag ());
+  SerialPuts (EFI_ERROR (Status) ? " could not protect LabBootCounter\n"
+                                 : " LabBootCounter is now read-only outside SMM\n");
+
   Handle = NULL;
-  Status = gSmst->SmiHandlerRegister (LabGuidHandler, &gLabSmmCommGuid, &Handle);
+  Status = mMmst->MmiHandlerRegister (LabGuidHandler, &gLabSmmCommGuid, &Handle);
   ASSERT_EFI_ERROR (Status);
 
   Handle = NULL;
-  Status = gSmst->SmiHandlerRegister (LabRootHandler, NULL, &Handle);
+  Status = mMmst->MmiHandlerRegister (LabRootHandler, NULL, &Handle);
   ASSERT_EFI_ERROR (Status);
 
-  SerialPuts ("[SMM] LabSmmHandler loaded into SMRAM. Handler at ");
+  SerialPuts (ModelTag ());
+  SerialPuts (MmModel == LAB_MM_MODEL_STANDALONE ? " LabMmHandler (Standalone MM) loaded into MMRAM. Handler at "
+                                                 : " LabSmmHandler loaded into SMRAM. Handler at ");
   SerialHex ((UINT64)(UINTN)LabGuidHandler);
   SerialPuts (", SMRAM ");
   SerialHex (mSmramBase);

@@ -43,6 +43,18 @@ $results['phase6-smm-flash'] = Test-LabVm "$PSScriptRoot\phase6-smm-flash" @(
     'SMM wrote it to flash: LabBootCounter =',
     '- stored') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin"
 
+Write-Host "`n== Phase 7: Standalone MM ==" -ForegroundColor Cyan
+& "$PSScriptRoot\phase7-standalone-mm\build.ps1"
+# Standalone MM keeps its whole heap in TSEG; 32 MiB gives the variable driver room.
+$results['phase7-standalone-mm'] = Test-LabVm "$PSScriptRoot\phase7-standalone-mm" @(
+    '[MM standalone] LabMmHandler (Standalone MM) loaded into MMRAM',
+    'model: STANDALONE MM',
+    'MM core copies it INTO MMRAM',
+    'PING through it: OK',
+    'model=STANDALONE, MMRAM pointer REJECTED, ordinary RAM REJECTED',
+    '(written by MM)') -TimeoutSec 180 -FirmwareDir "$PSScriptRoot\phase4-smm\firmware\bin-standalone" `
+    -ExtraArgs @('-global', 'mch.extended-tseg-mbytes=32')
+
 Write-Host "`n== Phase 5: our bootloader + our kernel ==" -ForegroundColor Cyan
 & "$PSScriptRoot\phase5-kernel\build.ps1"
 # isa-debug-exit lets the kernel end the VM after its 3-second boot check.
