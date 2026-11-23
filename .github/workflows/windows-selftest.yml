@@ -1,0 +1,51 @@
+# Runs the lab's own Windows 11 scripts on a GitHub-hosted Windows runner:
+# setup.cmd (tool detection), then selftest.cmd (build + boot phases 2-4 in QEMU).
+# Nothing here runs on anyone's own PC.
+name: Windows self-test
+
+on:
+  push:
+    paths:
+      - 'uefi-lab/**'
+      - '.github/workflows/windows-selftest.yml'
+  pull_request:
+    paths:
+      - 'uefi-lab/**'
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # LLVM (clang + lld-link) is preinstalled on GitHub's Windows images.
+      # QEMU isn't, and winget isn't available on runners, so use Chocolatey.
+      # The lab's scripts find both in their default C:\Program Files folders.
+      - name: Install QEMU
+        run: choco install qemu -y --no-progress
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\LLVM\bin\clang.exe" --version
+          & "$env:ProgramFiles\qemu\qemu-system-x86_64.exe" --version
+          Get-ChildItem "$env:ProgramFiles\qemu\share\edk2-*" | Select-Object Name, Length
+
+      # Same entry points a user runs. cmd -> Windows PowerShell 5.1.
+      - name: setup.cmd
+        shell: cmd
+        run: uefi-lab\setup.cmd
+
+      - name: selftest.cmd
+        shell: cmd
+        run: uefi-lab\selftest.cmd
+
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-logs
+          path: uefi-lab/*/serial.log
+          if-no-files-found: warn

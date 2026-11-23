@@ -5,10 +5,6 @@
 
 Write-Host "UEFI lab setup for Windows 11`n"
 
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw "winget not found. Install or update 'App Installer' from the Microsoft Store, then run setup.cmd again."
-}
-
 $packages = @(
     @{ Id = 'LLVM.LLVM';                       Name = 'LLVM / Clang'; Find = { Get-Clang } },
     @{ Id = 'SoftwareFreedomConservancy.QEMU'; Name = 'QEMU';         Find = { Get-Qemu } }
@@ -18,6 +14,9 @@ foreach ($pkg in $packages) {
     $found = & $pkg.Find
     if ($found) { Write-Host "[ok] $($pkg.Name): $found"; continue }
 
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "$($pkg.Name) is missing and winget was not found. Install or update 'App Installer' from the Microsoft Store, then run setup.cmd again."
+    }
     Write-Host "Installing $($pkg.Name) with winget. Accept the UAC prompt..." -ForegroundColor Cyan
     winget install --id $pkg.Id --exact --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) { throw "winget could not install $($pkg.Id) (exit code $LASTEXITCODE)." }
