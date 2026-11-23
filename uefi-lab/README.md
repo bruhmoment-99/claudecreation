@@ -42,6 +42,7 @@ needed).
 |---|---|---|
 | LLVM (clang, lld-link, ld.lld) | `LLVM.LLVM` | `C:\Program Files\LLVM\bin` |
 | QEMU (+ OVMF in `share\edk2-x86_64-code.fd`) | `SoftwareFreedomConservancy.QEMU` | `C:\Program Files\qemu` |
+| Python 3.x, only the version LLDB is linked against (3.10 for current LLVM) | `Python.Python.3.10` | per-user install; only Phase 8 needs it |
 
 The scripts find these even if the installers didn't add them to `PATH`. If
 your OVMF files are somewhere else, set `LAB_OVMF_CODE` and `LAB_OVMF_VARS`.
@@ -483,6 +484,12 @@ phase8-smm-gdb\debug.cmd -Standalone     :: same, on the Standalone MM firmware
 phase8-smm-gdb\debug.cmd -Demo           :: scripted tour with PASS/FAIL checks
 ```
 On Linux, `./debug.sh` uses GDB (`--lldb` for LLDB, `--standalone`, `--demo`).
+
+**One-time requirement:** on Windows, LLVM's `lldb.exe` is linked against one
+specific Python DLL (currently `python310.dll`) and won't even start without
+it: the error is exit code `0xC0000135`, DLL not found. `setup.cmd` checks
+this, installs the matching Python with winget, and `debug.cmd` adds it to
+`PATH` automatically.
 
 QEMU has a built-in GDB server. The debugger attaches to the **emulated
 CPU**, so it can stop it anywhere, even in SMM, where no OS debugger can
